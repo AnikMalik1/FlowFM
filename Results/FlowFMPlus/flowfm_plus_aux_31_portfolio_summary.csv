@@ -1,0 +1,2 @@
+n_tickers_used,mean_daily_pnl_bp,std_daily_pnl_bp,annualized_sharpe,cumulative_pnl_end_bp,max_drawdown_bp
+10,1.648513572793442,114.53455440447091,0.2284842492750325,905.0339514635973,-2509.9412499895016
