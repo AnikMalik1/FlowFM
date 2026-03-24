@@ -1,0 +1,30 @@
+#!/bin/bash
+#SBATCH --account=brics.s5e
+#SBATCH --partition=workq
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=72
+#SBATCH --gres=gpu:1
+#SBATCH --time=04:00:00
+#SBATCH --output=/projects/s5e/quant/fingan/FlowFM_ga/meta_loss/results/dual_%j.out
+#SBATCH --error=/projects/s5e/quant/fingan/FlowFM_ga/meta_loss/results/dual_%j.err
+
+source /projects/s5e/quant/miniforge3/etc/profile.d/conda.sh 2>/dev/null || true
+conda activate base 2>/dev/null || true
+export PATH="/projects/s5e/quant/miniforge3/bin:$PATH"
+
+set -euo pipefail
+
+echo "[$(date)] GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
+
+cd /projects/s5e/quant/fingan/FlowFM_ga/meta_loss
+
+POP=${POP_SIZE:-12}
+GEN=${GENERATIONS:-10}
+
+echo "[$(date)] Dual-Model GA: pop=$POP, generations=$GEN"
+echo "[$(date)] Budget: $((POP * GEN)) evals × 2 models = $((POP * GEN * 2)) trainings"
+
+python3 evolve_dual.py --pop-size $POP --generations $GEN --elite 2 --mutation-rate 0.3
+
+echo "[$(date)] Done (exit=$?)"

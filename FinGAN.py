@@ -444,7 +444,7 @@ def Evaluation2(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z_dim
         fake_noise = torch.randn(1,ntest, z_dim, device=device,dtype=torch.float)
         fake1 = gen(fake_noise,condition1,h0,c0)
         fake1 = fake1.unsqueeze(0).unsqueeze(2)
-        generated1 = torch.empty([1,1,1,ntest,1000])
+        generated1 = torch.empty([1,1,1,ntest,1000], device=device)
         generated1[0,0,0,:,0] = fake1[0,0,0,:,0].detach()
         #generated1 = fake1.detach()
         for i in range(999):        
@@ -464,7 +464,7 @@ def Evaluation2(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z_dim
     b1 = generated1.squeeze()
     mn1 = torch.mean(b1,dim=1)
     real1 = test_data[:,-1]
-    rl1 = real1.squeeze()
+    rl1 = real1.squeeze().to(mn1.device)
     rmse1 = torch.sqrt(torch.mean((mn1-rl1)**2))
     mae1 = torch.mean(torch.abs(mn1-rl1))
     #print("RMSE: ",rmse,"MAE: ",mae)
@@ -476,7 +476,7 @@ def Evaluation2(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z_dim
 
     #look at the Sharpe Ratio
     n_b1 = b1.shape[1]
-    PnL_ws1 = torch.empty(ntest)
+    PnL_ws1 = torch.empty(ntest, device=device)
     for i1 in range(ntest):
         fk1 = b1[i1,:]
         pu1 = (fk1>=0).sum()
@@ -540,7 +540,7 @@ def Evaluation2(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z_dim
         fake_noise = torch.randn(1,ntest, z_dim, device=device,dtype=torch.float)
         fake1 = gen(fake_noise,condition1,h0,c0)
         fake1 = fake1.unsqueeze(0).unsqueeze(2)
-        generated1 = torch.empty([1,1,1,ntest,1000])
+        generated1 = torch.empty([1,1,1,ntest,1000], device=device)
         generated1[0,0,0,:,0] = fake1[0,0,0,:,0].detach()
         #generated1 = fake1.detach()
         for i in range(999):        
@@ -571,7 +571,7 @@ def Evaluation2(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z_dim
 
     #look at the Sharpe Ratio
     n_b1 = b1.shape[1]
-    PnL_ws1 = torch.empty(ntest)
+    PnL_ws1 = torch.empty(ntest, device=device)
     for i1 in range(ntest):
         fk1 = b1[i1,:]
         pu1 = (fk1>=0).sum()
@@ -634,7 +634,7 @@ def Evaluation3(tickers,freq,gen,test, val, h,l,pred,hid_d,hid_g, z_dim, lrg, lr
             fake_noise = torch.randn(1,ntest, z_dim, device=device,dtype=torch.float)
             fake1 = gen(fake_noise,condition1,h0,c0)
             fake1 = fake1.unsqueeze(0).unsqueeze(2)
-            generated1 = torch.empty([1,1,1,ntest,1000])
+            generated1 = torch.empty([1,1,1,ntest,1000], device=device)
             generated1[0,0,0,:,0] = fake1[0,0,0,:,0].detach()
             #generated1 = fake1.detach()
             for i in range(999):        
@@ -666,7 +666,7 @@ def Evaluation3(tickers,freq,gen,test, val, h,l,pred,hid_d,hid_g, z_dim, lrg, lr
     
         #look at the Sharpe Ratio
         n_b1 = b1.shape[1]
-        PnL_ws1 = torch.empty(ntest)
+        PnL_ws1 = torch.empty(ntest, device=device)
         for i1 in range(ntest):
             fk1 = b1[i1,:]
             pu1 = (fk1>=0).sum()
@@ -720,7 +720,7 @@ def Evaluation3(tickers,freq,gen,test, val, h,l,pred,hid_d,hid_g, z_dim, lrg, lr
             fake_noise = torch.randn(1,ntest, z_dim, device=device,dtype=torch.float)
             fake1 = gen(fake_noise,condition1,h0,c0)
             fake1 = fake1.unsqueeze(0).unsqueeze(2)
-            generated1 = torch.empty([1,1,1,ntest,1000])
+            generated1 = torch.empty([1,1,1,ntest,1000], device=device)
             generated1[0,0,0,:,0] = fake1[0,0,0,:,0].detach()
             #generated1 = fake1.detach()
             for i in range(999):        
@@ -753,7 +753,7 @@ def Evaluation3(tickers,freq,gen,test, val, h,l,pred,hid_d,hid_g, z_dim, lrg, lr
     
         #look at the Sharpe Ratio
         n_b1 = b1.shape[1]
-        PnL_ws1 = torch.empty(ntest)
+        PnL_ws1 = torch.empty(ntest, device=device)
         for i1 in range(ntest):
             fk1 = b1[i1,:]
             pu1 = (fk1>=0).sum()
