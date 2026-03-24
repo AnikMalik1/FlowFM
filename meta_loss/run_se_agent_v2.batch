@@ -11,11 +11,13 @@
 
 set -euo pipefail
 
-# ── Conda ───────────────────────────────────────────────
-# conda.sh has stale hardcoded paths; use conda binary directly
+# ── Python env ──────────────────────────────────────────
+# conda shebangs point to stale /home path; python3 is ELF binary (fine)
+# base env packages are at miniforge3/lib/python3.12/site-packages/
 export PATH="/projects/s5e/quant/miniforge3/bin:$PATH"
-eval "$(/projects/s5e/quant/miniforge3/bin/conda shell.bash hook 2>/dev/null)"
-conda activate base
+export CONDA_PREFIX="/projects/s5e/quant/miniforge3"
+export LD_LIBRARY_PATH="/projects/s5e/quant/miniforge3/lib:${LD_LIBRARY_PATH:-}"
+echo "[$(date)] Python: $(python3 --version) at $(which python3)"
 
 # ── Antigravity Manager (LLM API proxy) ────────────────
 echo "[$(date)] Starting Antigravity Manager..."
