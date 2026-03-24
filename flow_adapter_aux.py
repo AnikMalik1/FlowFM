@@ -151,17 +151,26 @@ def fm_batch_loss_pnl(
     # Standard velocity MSE
     loss_fm = torch.mean((v_pred - v_target) ** 2)
 
-    # PnL auxiliary: estimate x1 from current (x_t, v_pred)
-    # x1_hat = x_t + (1-t) * v_pred  (first-order extrapolation to t=1)
-    x1_hat_n = x_t + (1.0 - t)[:, None] * v_pred
+    # PnL auxiliary: run short ODE to generate actual sample, then compute PnL.
+    # This is the FinGAN approach: loss on GENERATED sample, not intermediate state.
+    # Previous attempts (tanh or linear on single-step extrapolation) failed because
+    # they couldn't control the aggregated pu across multiple ODE trajectories.
+    # Running the actual ODE makes the gradient flow through the full generation path.
+    pnl_steps = 10  # fewer steps than inference (40) for speed
+    x0_pnl = torch.randn_like(x1)  # fresh noise
+    x_gen = x0_pnl
+    dt_pnl = 1.0 / pnl_steps
+    for k in range(pnl_steps):
+        t_pnl = torch.full((B,), (k + 0.5) * dt_pnl, device=x1.device)
+        v_gen = model(x_gen, cond, t_pnl)
+        x_gen = x_gen + dt_pnl * v_gen  # differentiable chain
 
-    # Linear PnL proxy: x1_hat * x1_real (no tanh, no saturation)
-    # Gradient always flows: d(loss)/d(v_pred) = -(1-t) * x1_real
-    # Rewards directional correctness weighted by actual return magnitude.
-    # Unlike tanh(100*x) which saturates and kills gradients, this has
-    # uniform gradient flow everywhere.
-    pnl_proxy = x1_hat_n * x1_real
-    loss_pnl = -torch.mean(pnl_proxy)  # negative because we maximize PnL
+    # x_gen is the generated sample in normalized space.
+    # tanh(20*x) as soft sign: saturates at |x|>0.15 (normalized returns std~1).
+    # Unlike tanh(100*x) on intermediate states which was always saturated,
+    # here x_gen is a proper generated sample with meaningful variance.
+    pnl_proxy = torch.tanh(20.0 * x_gen) * x1_real
+    loss_pnl = -torch.mean(pnl_proxy)
 
     total = loss_fm + lambda_pnl * loss_pnl
     return total, loss_fm, loss_pnl
