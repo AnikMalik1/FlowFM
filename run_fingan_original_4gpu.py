@@ -11,7 +11,7 @@ sys.path.insert(0, "/projects/s5e/quant/fingan/FlowFM_repo")
 
 dataloc = "/projects/s5e/quant/fingan/FlowFM/data/"
 etflistloc = "/projects/s5e/quant/fingan/FlowFM_repo/stocks-etfs-list.csv"
-loc = "/projects/s5e/quant/fingan/FlowFM/Fin-GAN-orig/"
+loc = "/projects/s5e/quant/fingan/FlowFM/Fin-GAN-fast-bsz/"
 
 TICKERS = [
     "AMZN","HD","NKE","CL","EL","KO","PEP","APA","OXY",
@@ -27,6 +27,7 @@ def train_ticker(gpu_id, ticker, ti):
 
     t0 = time.time()
     try:
+        # BSZ=10000 > max N (~8846) → 1 batch/epoch, ~3x faster training
         df, corr = FinGAN.FinGAN_combos(
             ticker=ticker,
             loc=loc,
@@ -44,7 +45,7 @@ def train_ticker(gpu_id, ticker, ti):
             tr=0.8, vl=0.1,
             z_dim=8, hid_d=8, hid_g=8,
             checkpoint_epoch=20,
-            batch_size=100,
+            batch_size=10000,
             diter=1,
             plot=False,
             freq=2,
