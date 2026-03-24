@@ -1,0 +1,15 @@
+#!/bin/bash
+#SBATCH --account=brics.s5e
+#SBATCH --partition=workq
+#SBATCH --nodes=1
+#SBATCH --time=00:15:00
+#SBATCH --output=/projects/s5e/quant/fingan/logs/pu_comparison_%j.out
+#SBATCH --error=/projects/s5e/quant/fingan/logs/pu_comparison_%j.err
+
+mkdir -p /projects/s5e/quant/fingan/logs
+
+export PATH="/projects/s5e/quant/miniforge3/bin:$PATH"
+export LD_LIBRARY_PATH="/opt/nvidia/hpc_sdk/Linux_aarch64/cuda-12.6/lib64:${LD_LIBRARY_PATH}"
+export CUDA_HOME="/opt/nvidia/hpc_sdk/Linux_aarch64/cuda-12.6"
+
+python3 /projects/s5e/quant/fingan/pu_comparison_gpu.py
