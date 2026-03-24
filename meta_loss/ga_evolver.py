@@ -212,9 +212,13 @@ def crossover(parent_a: dict, parent_b: dict) -> dict:
                 0.5 * seen[t["name"]]["weight"] + 0.5 * t["weight"], 2
             )
 
-    # Random subset of 1-4 terms
-    n = random.randint(1, max(1, min(4, len(seen))))
-    child["terms"] = random.sample(list(seen.values()), n)
+    # Random subset of 1-4 terms (handle empty parents like velocity_only)
+    term_pool = list(seen.values())
+    if not term_pool:
+        child["terms"] = []
+    else:
+        n = random.randint(1, min(4, len(term_pool)))
+        child["terms"] = random.sample(term_pool, n)
 
     # Blend curriculum
     if random.random() < 0.5:
