@@ -132,3 +132,96 @@ FINGAN_BASELINES = {
     "fingan_sr":         fingan_sr,
     "fingan_sr_mse":     fingan_sr_mse,
 }
+
+
+# ──────────────────────────────────────────────────────────────
+# Baseline code strings in FinGAN 3-arg interface: loss_fn(gen_out, real, tanh_temp)
+# These can be fed directly to LLM as seed examples and into SE-Agent init pool.
+# "velocity_only" = no financial loss (return 0), so FinGAN trains with BCE only.
+# ──────────────────────────────────────────────────────────────
+
+FINGAN_BASELINE_CODES = {
+    "baseline_bce_only": (
+        "import torch\n"
+        "\n"
+        "def loss_fn(gen_out, real, tanh_temp):\n"
+        "    # No financial loss; FinGAN trains with BCE only.\n"
+        "    return torch.tensor(0.0, device=gen_out.device, requires_grad=False)\n"
+    ),
+    "baseline_pnl": (
+        "import torch\n"
+        "\n"
+        "def loss_fn(gen_out, real, tanh_temp):\n"
+        "    # Maximize PnL: tanh-smoothed position * realized return\n"
+        "    pnl = torch.mean(torch.tanh(tanh_temp * gen_out) * real)\n"
+        "    return -pnl\n"
+    ),
+    "baseline_pnl_std": (
+        "import torch\n"
+        "\n"
+        "def loss_fn(gen_out, real, tanh_temp):\n"
+        "    # Maximize PnL + penalize PnL volatility\n"
+        "    pnl = torch.tanh(tanh_temp * gen_out) * real\n"
+        "    return -torch.mean(pnl) + torch.std(pnl, unbiased=False)\n"
+    ),
+    "baseline_pnl_mse": (
+        "import torch\n"
+        "import torch.nn.functional as F\n"
+        "\n"
+        "def loss_fn(gen_out, real, tanh_temp):\n"
+        "    # Maximize PnL + prediction accuracy\n"
+        "    pnl = torch.mean(torch.tanh(tanh_temp * gen_out) * real)\n"
+        "    mse = F.mse_loss(gen_out, real)\n"
+        "    return -pnl + mse\n"
+    ),
+    "baseline_pnl_sr": (
+        "import torch\n"
+        "\n"
+        "def loss_fn(gen_out, real, tanh_temp):\n"
+        "    # Maximize PnL + Sharpe ratio\n"
+        "    pnl = torch.tanh(tanh_temp * gen_out) * real\n"
+        "    sharpe = pnl.mean() / (pnl.std(unbiased=False) + 1e-8)\n"
+        "    return -torch.mean(pnl) - sharpe\n"
+    ),
+    "baseline_pnl_mse_std": (
+        "import torch\n"
+        "import torch.nn.functional as F\n"
+        "\n"
+        "def loss_fn(gen_out, real, tanh_temp):\n"
+        "    # Maximize PnL + prediction accuracy + penalize volatility\n"
+        "    pnl = torch.tanh(tanh_temp * gen_out) * real\n"
+        "    mse = F.mse_loss(gen_out, real)\n"
+        "    return -torch.mean(pnl) + mse + torch.std(pnl, unbiased=False)\n"
+    ),
+    "baseline_pnl_mse_sr": (
+        "import torch\n"
+        "import torch.nn.functional as F\n"
+        "\n"
+        "def loss_fn(gen_out, real, tanh_temp):\n"
+        "    # Maximize PnL + prediction accuracy + Sharpe\n"
+        "    pnl = torch.tanh(tanh_temp * gen_out) * real\n"
+        "    sharpe = pnl.mean() / (pnl.std(unbiased=False) + 1e-8)\n"
+        "    mse = F.mse_loss(gen_out, real)\n"
+        "    return -torch.mean(pnl) + mse - sharpe\n"
+    ),
+    "baseline_sr": (
+        "import torch\n"
+        "\n"
+        "def loss_fn(gen_out, real, tanh_temp):\n"
+        "    # Maximize Sharpe ratio only\n"
+        "    pnl = torch.tanh(tanh_temp * gen_out) * real\n"
+        "    sharpe = pnl.mean() / (pnl.std(unbiased=False) + 1e-8)\n"
+        "    return -sharpe\n"
+    ),
+    "baseline_sr_mse": (
+        "import torch\n"
+        "import torch.nn.functional as F\n"
+        "\n"
+        "def loss_fn(gen_out, real, tanh_temp):\n"
+        "    # Maximize Sharpe + prediction accuracy\n"
+        "    pnl = torch.tanh(tanh_temp * gen_out) * real\n"
+        "    sharpe = pnl.mean() / (pnl.std(unbiased=False) + 1e-8)\n"
+        "    mse = F.mse_loss(gen_out, real)\n"
+        "    return -sharpe + mse\n"
+    ),
+}

@@ -231,48 +231,27 @@ def main():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    results_dir = os.path.join(config.RESULTS_DIR, "llm_fingan_v2")
+    results_dir = os.path.join(config.RESULTS_DIR, "llm_fingan_v3")
     os.makedirs(results_dir, exist_ok=True)
 
     all_results = []
     baseline_sr = None
 
-    # ── Evaluate baselines ───────────────────────────────
-    print("=== Evaluating baselines ===")
-    from losses.fingan_baselines import FINGAN_BASELINES
+    # ── Evaluate baselines using code strings ────────────
+    print("=== Evaluating baselines (3-arg code strings) ===")
+    from losses.fingan_baselines import FINGAN_BASELINE_CODES
 
-    for bname, bfn in FINGAN_BASELINES.items():
+    baseline_codes = {}  # name -> code string (for prompt)
+    for bname, bcode in FINGAN_BASELINE_CODES.items():
         print(f"\n--- {bname} ---")
-        def make_fingan_fn(base_fn):
-            def fingan_fn(gen_out, real, tanh_temp):
-                x_pred = gen_out.unsqueeze(-1) if gen_out.dim() == 1 else gen_out
-                x_real = real.unsqueeze(-1) if real.dim() == 1 else real
-                v_dummy = torch.zeros_like(x_pred)
-                cond_dummy = torch.zeros(x_pred.shape[0], 10, device=x_pred.device)
-                return base_fn(v_dummy, v_dummy, x_pred, x_real, cond_dummy, epoch=100)
-            return fingan_fn
-
-        fingan_fn = make_fingan_fn(bfn)
-        per_ticker = {}
-        seeds = list(range(42, 42 + n_seeds))
-        for ticker in config.STAGE1_TICKERS:
-            sr_per_seed = []
-            for seed in seeds:
-                r = train_single_ticker_fingan(
-                    ticker=ticker, financial_loss_fn=fingan_fn,
-                    max_epochs=100, warmup_epochs=15,
-                    eval_every=20, patience=6,
-                    device=device, verbose=(seed == 42), seed=seed)
-                sr_per_seed.append(r["val_sr"])
-            per_ticker[ticker] = float(np.mean(sr_per_seed))
-
-        mean_sr = float(np.mean(list(per_ticker.values())))
-        result = {"loss_name": bname, "mean_sr": mean_sr, "per_ticker": per_ticker, "origin": "baseline"}
+        result = evaluate_fingan(bcode, bname, device, n_seeds=n_seeds)
+        result["origin"] = "baseline"
         all_results.append(result)
-        print(f"  Mean SR: {mean_sr:.4f}")
+        baseline_codes[bname] = bcode
+        print(f"  Mean SR: {result['mean_sr']:.4f}")
 
-        if bname == "velocity_only":
-            baseline_sr = mean_sr
+        if bname == "baseline_bce_only":
+            baseline_sr = result["mean_sr"]
 
     if baseline_sr is None or baseline_sr <= 0:
         baseline_sr = max(r["mean_sr"] for r in all_results if r["mean_sr"] > -900) or 1.0
@@ -280,12 +259,12 @@ def main():
     # Leaderboard
     sorted_r = sorted(all_results, key=lambda x: -x["mean_sr"])
     print(f"\n{'='*50}")
-    print("BASELINE LEADERBOARD (normalized by velocity_only)")
+    print(f"BASELINE LEADERBOARD (norm by BCE-only SR={baseline_sr:.4f})")
     for i, r in enumerate(sorted_r):
         norm = r["mean_sr"] / baseline_sr
         print(f"  {i+1}. {r['loss_name']:25s} SR={r['mean_sr']:.4f} (norm={norm:.3f})")
 
-    # ── Build archive for initial prompt ─────────────────
+    # ── Build archive with CODE for initial prompt ───────
     archive_lines = []
     for r in sorted_r:
         norm = r["mean_sr"] / baseline_sr
@@ -294,6 +273,14 @@ def main():
             f"per_ticker={json.dumps(r.get('per_ticker', {}))}"
         )
     archive_str = "\n".join(archive_lines)
+
+    # Top-3 baseline SOURCE CODE
+    top3_code_str = "\n\n".join(
+        f"### {r['loss_name']} (SR={r['mean_sr']:.4f}, norm={r['mean_sr']/baseline_sr:.3f})\n"
+        f"```python\n{baseline_codes.get(r['loss_name'], 'N/A')}\n```"
+        for r in sorted_r[:3]
+        if r['loss_name'] in baseline_codes
+    )
 
     # ── Initialize conversation ──────────────────────────
     if args.resume and os.path.exists(args.resume):
@@ -304,12 +291,11 @@ def main():
     else:
         messages = [{"role": "system", "content": LOSS_SYSTEM_V2}]
         first_prompt = (
-            f"Here are the baseline results (normalized SR = raw SR / velocity_only SR):\n"
-            f"{archive_str}\n\n"
-            f"The velocity_only baseline (BCE loss only, no financial terms) has "
-            f"SR={baseline_sr:.4f} (normalized=1.000).\n"
-            f"Any loss with normalized SR > 1.0 improves over the baseline.\n\n"
-            f"Please generate a novel loss function that beats the best baseline.\n"
+            f"Here are the baseline results:\n{archive_str}\n\n"
+            f"## Top-3 Baseline SOURCE CODE:\n{top3_code_str}\n\n"
+            f"The BCE-only baseline (no financial loss) has SR={baseline_sr:.4f} (norm=1.000).\n"
+            f"Your task: IMPROVE on the best baseline. Start from its structure and "
+            f"make targeted improvements. Do not reinvent from scratch.\n\n"
             f'Respond with JSON: {{"thought": "...", "name": "...", "code": "..."}}'
         )
         messages.append({"role": "user", "content": first_prompt})

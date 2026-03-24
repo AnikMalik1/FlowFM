@@ -222,15 +222,17 @@ PLANNING_STRATEGIES = [
     "Focus on robust estimation: use Huber loss or trimmed mean for PnL.",
 ]
 
-def generate_initial_population(n: int = 5) -> list[dict]:
-    """Multi-Planning: generate diverse loss functions using different strategies."""
+def generate_initial_population(n: int = 5, baseline_context: str = "") -> list[dict]:
+    """Multi-Planning: generate improvements on baselines using different strategies."""
     population = []
     for i, strategy in enumerate(PLANNING_STRATEGIES[:n]):
         prompt = (
-            f"Generate a novel loss function for FinGAN.\n\n"
-            f"Strategy: {strategy}\n\n"
-            f"Respond with JSON: "
-            f'{{"thought": "...", "name": "...", "code": "..."}}'
+            f"Here are the current best loss functions for FinGAN:\n\n"
+            f"{baseline_context}\n\n"
+            f"Your task: IMPROVE on these baselines using this strategy:\n"
+            f"  {strategy}\n\n"
+            f"Start from the best baseline's structure and make targeted changes.\n"
+            f'Respond with JSON: {{"thought": "...", "name": "...", "code": "..."}}'
         )
 
         text = _llm_call(LOSS_SYSTEM, prompt)
@@ -385,68 +387,208 @@ def run_se_agent(
     n_initial: int = 5,
     n_seeds: int = 3,
     device=None,
-    results_dir: str = "results/se_agent_v2",
+    results_dir: str = "results/se_agent_v3",
     verbose: bool = True,
+    resume_path: str = None,
 ):
     os.makedirs(results_dir, exist_ok=True)
     registry = LossRegistry()
     all_results = []
-    baseline_sr = 1.0  # will be set from baselines if available
+    baseline_sr = 1.0
+    start_cycle = 1
 
-    # ── Phase 0: Evaluate velocity_only baseline ─────────
+    # ── Resume from previous run ─────────────────────────
+    if resume_path and os.path.exists(resume_path):
+        print(f"\n{'='*60}")
+        print(f"  Resuming from {resume_path}")
+        print(f"{'='*60}")
+        with open(resume_path) as f:
+            data = json.load(f)
+        population = data.get("population", [])
+        baseline_sr = data.get("baseline_sr", 1.0)
+        start_cycle = data.get("cycle", 0) + 1
+        all_results = [{"name": r["name"], "sr": r["sr"],
+                        "norm_sr": r.get("norm_sr")} for r in data.get("all_results", [])]
+        print(f"  Loaded pool of {len(population)}, baseline_sr={baseline_sr:.4f}")
+        print(f"  Starting from cycle {start_cycle}")
+
+    else:
+        # ── Phase 0: Evaluate ALL baselines with code ────
+        print(f"\n{'='*60}")
+        print(f"  SE-Agent v3: Evaluating 9 baselines as seed population")
+        print(f"{'='*60}")
+        from losses.fingan_baselines import FINGAN_BASELINE_CODES
+
+        population = []
+        for bname, bcode in FINGAN_BASELINE_CODES.items():
+            print(f"\n--- {bname} ---")
+            result = evaluate_loss(bcode, bname, registry, device,
+                                   n_seeds=n_seeds, baseline_sr=1.0)
+            population.append({
+                "name": bname, "code": bcode,
+                "sr": result["sr"], "norm_sr": 0,
+                "per_ticker": result.get("per_ticker", {}),
+                "origin": "baseline",
+            })
+            all_results.append(result)
+            print(f"  SR = {result['sr']:.4f}")
+
+        # Set baseline_sr from bce_only (no financial loss)
+        bce_result = next((p for p in population if p["name"] == "baseline_bce_only"), None)
+        if bce_result and bce_result["sr"] > 0:
+            baseline_sr = bce_result["sr"]
+        else:
+            baseline_sr = max(p["sr"] for p in population if p["sr"] > -900) or 1.0
+
+        # Update norm_sr for all baselines
+        for p in population:
+            p["norm_sr"] = p["sr"] / baseline_sr if p["sr"] > -900 else -999
+
+        # Leaderboard
+        sorted_bl = sorted(population, key=lambda x: -x.get("sr", -999))
+        print(f"\n--- Baseline Leaderboard (norm by BCE-only SR={baseline_sr:.4f}) ---")
+        for i, p in enumerate(sorted_bl):
+            print(f"  {i+1}. SR={p['sr']:.4f} (norm={p.get('norm_sr',0):.3f}) | {p['name']}")
+
+        # ── Phase 1: LLM improves on baselines ──────────
+        print(f"\n{'='*60}")
+        print(f"  SE-Agent v3: LLM generating {n_initial} improvements on baselines")
+        print(f"{'='*60}")
+
+        # Build context: top-3 baseline code + results
+        top3 = sorted_bl[:3]
+        baseline_context = "\n\n".join(
+            f"### {p['name']} (SR={p['sr']:.4f}, norm={p.get('norm_sr',0):.3f})\n"
+            f"```python\n{p['code']}\n```"
+            for p in top3
+        )
+
+        llm_plans = generate_initial_population(n_initial, baseline_context=baseline_context)
+
+        # Evaluate LLM plans
+        print(f"\n--- Evaluating LLM improvements ---")
+        for i, cand in enumerate(llm_plans):
+            print(f"\n[{i+1}/{len(llm_plans)}] {cand['name']}")
+            result = evaluate_loss(cand["code"], cand["name"], registry, device,
+                                   n_seeds=n_seeds, baseline_sr=baseline_sr)
+            cand["sr"] = result["sr"]
+            cand["norm_sr"] = result.get("norm_sr", -999)
+            cand["per_ticker"] = result.get("per_ticker", {})
+            all_results.append(result)
+            print(f"  SR = {result['sr']:.4f} (norm={result.get('norm_sr', -999):.3f})")
+
+        population.extend(llm_plans)
+
+        # Select top-8 for cycles
+        population = select_elite(population, k=8)
+        print(f"\n--- Init complete. Top-8 elite pool ---")
+        for i, p in enumerate(population):
+            print(f"  {i+1}. SR={p.get('sr',-999):.4f} (norm={p.get('norm_sr',0):.3f}) | {p['name']}")
+
+    for cycle in range(start_cycle, n_cycles + 1):
+        print(f"\n{'#'*60}")
+        print(f"  SE-Agent CYCLE {cycle}/{n_cycles}")
+        best_sr = max(c.get('sr', -999) for c in population)
+        best_norm = best_sr / baseline_sr if baseline_sr > 0 else 0
+        print(f"  Pool size: {len(population)}, Best SR: {best_sr:.4f} (norm={best_norm:.3f})")
+        print(f"{'#'*60}")
+
+        new_candidates = []
+
+        # ── Revision: reflect + revise each candidate ────
+        print(f"\n--- Revision ---")
+        for cand in select_elite(population, k=3):
+            if cand.get("sr", -999) <= -900:
+                continue
+            result = next((r for r in all_results if r["name"] == cand["name"]), None)
+            if result:
+                revised = reflect_and_revise(cand, result, baseline_sr)
+                new_candidates.append(revised)
+                print(f"  Revised {cand['name']} -> {revised['name']}")
+                if revised.get("thought"):
+                    print(f"    Thought: {revised['thought'][:150]}...")
+
+        # ── Recombination: crossover top pairs ───────────
+        print(f"\n--- Recombination ---")
+        elite = select_elite(population, k=4)
+        if len(elite) >= 2:
+            crossed = crossover(elite[0], elite[1])
+            new_candidates.append(crossed)
+            print(f"  Crossover: {elite[0]['name']} x {elite[1]['name']} -> {crossed['name']}")
+
+            if len(elite) >= 3:
+                transferred = transfer(elite[-1], elite[:2])
+                new_candidates.append(transferred)
+                print(f"  Transfer: top-2 -> {transferred['name']}")
+
+            restructured = restructure(population)
+            new_candidates.append(restructured)
+            print(f"  Restructure: pool -> {restructured['name']}")
+
+        # ── Evaluate all new candidates ──────────────────
+        print(f"\n--- Evaluate {len(new_candidates)} new candidates ---")
+        for i, cand in enumerate(new_candidates):
+            name = f"c{cycle}_{cand['name']}"
+            cand["name"] = name
+            print(f"\n[{i+1}/{len(new_candidates)}] {name}")
+            result = evaluate_loss(cand["code"], name, registry, device,
+                                   n_seeds=n_seeds, baseline_sr=baseline_sr)
+            cand["sr"] = result["sr"]
+            cand["norm_sr"] = result.get("norm_sr", -999)
+            cand["per_ticker"] = result.get("per_ticker", {})
+            all_results.append(result)
+            print(f"  SR = {result['sr']:.4f} (norm={result.get('norm_sr', -999):.3f})")
+
+        # ── Refinement: select top-K for next cycle ──────
+        population.extend(new_candidates)
+        population = select_elite(population, k=8)
+
+        # Leaderboard
+        print(f"\n--- Cycle {cycle} Leaderboard ---")
+        for i, c in enumerate(population[:10]):
+            norm = c.get('sr', -999) / baseline_sr if baseline_sr > 0 else 0
+            print(f"  {i+1}. SR={c.get('sr',-999):.4f} (norm={norm:.3f}) | {c['name']}")
+
+        # Save cycle results (enables resume)
+        cycle_path = os.path.join(results_dir, f"cycle_{cycle}.json")
+        with open(cycle_path, "w") as f:
+            json.dump({
+                "cycle": cycle,
+                "baseline_sr": baseline_sr,
+                "population": [{"name": c["name"], "sr": c.get("sr"),
+                                "norm_sr": c.get("norm_sr"), "code": c["code"]}
+                               for c in population],
+                "all_results": [{"name": r["name"], "sr": r.get("sr", r.get("mean_sr")),
+                                 "norm_sr": r.get("norm_sr")} for r in all_results],
+                "new_candidates": [{"name": c["name"], "sr": c.get("sr"),
+                                    "norm_sr": c.get("norm_sr")} for c in new_candidates],
+            }, f, indent=2, default=str)
+
+    # Final
+    best = max(population, key=lambda x: x.get("sr", -999))
+    best_norm = best.get("sr", 0) / baseline_sr if baseline_sr > 0 else 0
     print(f"\n{'='*60}")
-    print(f"  SE-Agent v2: Evaluating velocity_only baseline for normalization")
+    print(f"  SE-Agent v3 COMPLETE")
+    print(f"  Best: {best['name']} SR={best.get('sr',-999):.4f} (norm={best_norm:.3f})")
+    print(f"  Total evaluations: {len(all_results)}")
     print(f"{'='*60}")
-    from losses.fingan_baselines import FINGAN_BASELINES
-    if "velocity_only" in FINGAN_BASELINES:
-        bfn = FINGAN_BASELINES["velocity_only"]
-        def make_fingan_fn(base_fn):
-            def fingan_fn(gen_out, real, tanh_temp):
-                x_pred = gen_out.unsqueeze(-1) if gen_out.dim() == 1 else gen_out
-                x_real = real.unsqueeze(-1) if real.dim() == 1 else real
-                v_dummy = torch.zeros_like(x_pred)
-                cond_dummy = torch.zeros(x_pred.shape[0], 10, device=x_pred.device)
-                return base_fn(v_dummy, v_dummy, x_pred, x_real, cond_dummy, epoch=100)
-            return fingan_fn
+    print(f"\nBest loss code:\n{best['code']}")
 
-        fingan_fn = make_fingan_fn(bfn)
-        seeds = list(range(42, 42 + n_seeds))
-        per_ticker = {}
-        for ticker in config.STAGE1_TICKERS:
-            sr_per_seed = []
-            for seed in seeds:
-                r = train_single_ticker_fingan(
-                    ticker=ticker, financial_loss_fn=fingan_fn,
-                    max_epochs=100, warmup_epochs=15,
-                    eval_every=20, patience=6,
-                    device=device, verbose=(seed == 42), seed=seed)
-                sr_per_seed.append(r["val_sr"])
-            per_ticker[ticker] = float(np.mean(sr_per_seed))
+    final_path = os.path.join(results_dir, "se_agent_v3_final.json")
+    with open(final_path, "w") as f:
+        json.dump({
+            "cycle": n_cycles,
+            "baseline_sr": baseline_sr,
+            "best": {"name": best["name"], "sr": best.get("sr"),
+                     "norm_sr": best_norm, "code": best["code"]},
+            "all_results": [{"name": r["name"], "sr": r.get("sr", r.get("mean_sr")),
+                             "norm_sr": r.get("norm_sr")} for r in all_results],
+            "population": [{"name": c["name"], "sr": c.get("sr"),
+                            "norm_sr": c.get("norm_sr"), "code": c["code"]}
+                           for c in population],
+        }, f, indent=2, default=str)
 
-        baseline_sr = float(np.mean(list(per_ticker.values())))
-        if baseline_sr <= 0:
-            baseline_sr = 1.0
-        print(f"  velocity_only baseline SR: {baseline_sr:.4f} (this is norm=1.000)")
-
-    # ── Phase 1: Generate diverse initial population ─────
-    print(f"\n{'='*60}")
-    print(f"  SE-Agent v2: Generating {n_initial} diverse loss functions")
-    print(f"{'='*60}")
-
-    population = generate_initial_population(n_initial)
-
-    # Evaluate initial population
-    print(f"\n--- Evaluating initial population ---")
-    for i, cand in enumerate(population):
-        print(f"\n[{i+1}/{len(population)}] {cand['name']}")
-        result = evaluate_loss(cand["code"], cand["name"], registry, device,
-                               n_seeds=n_seeds, baseline_sr=baseline_sr)
-        cand["sr"] = result["sr"]
-        cand["norm_sr"] = result.get("norm_sr", -999)
-        cand["per_ticker"] = result.get("per_ticker", {})
-        all_results.append(result)
-        print(f"  SR = {result['sr']:.4f} (norm={result.get('norm_sr', -999):.3f})")
-        if cand.get("thought"):
+    return all_results
             print(f"  Thought: {cand['thought'][:150]}...")
 
     for cycle in range(1, n_cycles + 1):
@@ -556,6 +698,8 @@ if __name__ == "__main__":
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--initial", type=int, default=5)
     parser.add_argument("--n_seeds", type=int, default=3)
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to cycle_N.json or se_agent_v3_final.json to resume from")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -565,4 +709,5 @@ if __name__ == "__main__":
         torch.backends.cuda.matmul.allow_tf32 = True
 
     run_se_agent(n_cycles=args.cycles, n_initial=args.initial,
-                 n_seeds=args.n_seeds, device=device)
+                 n_seeds=args.n_seeds, device=device,
+                 resume_path=args.resume)
