@@ -22,13 +22,7 @@ TICKERS = [
 
 
 def train_ticker(gpu_id, ticker, ti):
-    # Set CUDA_VISIBLE_DEVICES BEFORE importing torch/FinGAN
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
     import torch
-    assert torch.cuda.is_available(), f"GPU {gpu_id} not available"
-    torch.backends.cuda.matmul.allow_tf32 = True
-
     import FinGAN
 
     t0 = time.time()
@@ -80,39 +74,22 @@ def worker(gpu_id, assignments, result_dict):
 
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn")
-
     for d in ["PnLs", "Results", "Plots", "TrainedModels"]:
         os.makedirs(os.path.join(loc, d), exist_ok=True)
 
-    n_gpus = int(os.environ.get("SLURM_GPUS_ON_NODE", 4))
-    print(f"GPUs: {n_gpus}, Tickers: {len(TICKERS)}", flush=True)
-
-    assignments = [[] for _ in range(n_gpus)]
-    for i, t in enumerate(TICKERS):
-        assignments[i % n_gpus].append((i, t))
-
-    for g in range(n_gpus):
-        print(f"  GPU {g}: {[t for _,t in assignments[g]]}", flush=True)
-
-    manager = mp.Manager()
-    result_dict = manager.dict()
-
-    t0 = time.time()
-    procs = []
-    for g in range(n_gpus):
-        if assignments[g]:
-            p = mp.Process(target=worker, args=(g, assignments[g], result_dict))
-            p.start()
-            procs.append(p)
-
-    for p in procs:
-        p.join()
+    print(f"Tickers: {len(TICKERS)}, sequential on cuda:0", flush=True)
 
     all_rows = []
-    for g in range(n_gpus):
-        if g in result_dict:
-            all_rows.extend(result_dict[g])
+    t0 = time.time()
+    for i, ticker in enumerate(TICKERS):
+        print(f"\n===== {ticker} ({i+1}/{len(TICKERS)}) =====", flush=True)
+        rows = train_ticker(0, ticker, i)
+        all_rows.extend(rows)
+
+        # Save partial results after each ticker
+        if all_rows:
+            pd.DataFrame(all_rows).to_csv(
+                os.path.join(loc, "Results", "fingan_full_results_partial.csv"), index=False)
 
     if all_rows:
         df = pd.DataFrame(all_rows)
