@@ -463,7 +463,7 @@ def Evaluation2(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z_dim
     #print("MAE: ",mae)
     b1 = generated1.squeeze()
     mn1 = torch.mean(b1,dim=1)
-    real1 = test_data[:,-1]
+    real1 = test_data[:,-1].to(device)
     rl1 = real1.squeeze()
     rmse1 = torch.sqrt(torch.mean((mn1-rl1)**2))
     mae1 = torch.mean(torch.abs(mn1-rl1))
@@ -509,8 +509,8 @@ def Evaluation2(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z_dim
     print("Annualised (test) SR_w: ",SR1*np.sqrt(252))
     
     distcheck = np.array(b1[1,:].cpu())
-    means = np.array(mn1.detach())
-    reals = np.array(rl1.detach())
+    means = np.array(mn1.detach().cpu())
+    reals = np.array(rl1.detach().cpu())
     dt['Corr'] = np.corrcoef([means,reals])[0,1]
     dt['Pos mn'] = np.sum(means >0)/ len(means)
     dt['Neg mn'] = np.sum(means <0)/ len(means)
@@ -559,7 +559,7 @@ def Evaluation2(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z_dim
     #print("MAE: ",mae)
     b1 = generated1.squeeze()
     mn1 = torch.mean(b1,dim=1)
-    real1 = val_data[:,-1]
+    real1 = val_data[:,-1].to(device)
     rl1 = real1.squeeze()
     rmse1 = torch.sqrt(torch.mean((mn1-rl1)**2))
     mae1 = torch.mean(torch.abs(mn1-rl1))
@@ -592,8 +592,8 @@ def Evaluation2(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z_dim
     
     print("Annualised (val) SR_w : ",SR1*np.sqrt(252))
     
-    means = np.array(mn1.detach())
-    reals = np.array(rl1.detach())
+    means = np.array(mn1.detach().cpu())
+    reals = np.array(rl1.detach().cpu())
     dt['Corr val'] = np.corrcoef([means,reals])[0,1]
     dt['Pos mn val'] = np.sum(means >0)/ len(means)
     dt['Neg mn val'] = np.sum(means <0)/ len(means)
@@ -654,8 +654,8 @@ def Evaluation3(tickers,freq,gen,test, val, h,l,pred,hid_d,hid_g, z_dim, lrg, lr
         b1 = generated1.squeeze()
         mn1 = torch.mean(b1,dim=1)
         # print(mn1.shape)
-        means_test[ii, :] = np.array(mn1.detach())
-        real1 = test_data[:,-1]
+        means_test[ii, :] = np.array(mn1.detach().cpu())
+        real1 = test_data[:,-1].to(device)
         rl1 = real1.squeeze()
         rmse1 = torch.sqrt(torch.mean((mn1-rl1)**2))
         mae1 = torch.mean(torch.abs(mn1-rl1))
@@ -690,8 +690,8 @@ def Evaluation3(tickers,freq,gen,test, val, h,l,pred,hid_d,hid_g, z_dim, lrg, lr
         dist_loc = plotsloc+"distcheck-"+f_name+".png"
         
         distcheck = np.array(b1[1,:].cpu())
-        means = np.array(mn1.detach())
-        reals = np.array(rl1.detach())
+        means = np.array(mn1.detach().cpu())
+        reals = np.array(rl1.detach().cpu())
         dt['Corr'] = np.corrcoef([means,reals])[0,1]
         dt['Pos mn'] = np.sum(means >0)/ len(means)
         dt['Neg mn'] = np.sum(means <0)/ len(means)
@@ -739,9 +739,9 @@ def Evaluation3(tickers,freq,gen,test, val, h,l,pred,hid_d,hid_g, z_dim, lrg, lr
         #print("MAE: ",mae)
         b1 = generated1.squeeze()
         mn1 = torch.mean(b1,dim=1)
-        means_val[ii, :] = np.array(mn1.detach())
+        means_val[ii, :] = np.array(mn1.detach().cpu())
 
-        real1 = val_data[:,-1]
+        real1 = val_data[:,-1].to(device)
         rl1 = real1.squeeze()
         rmse1 = torch.sqrt(torch.mean((mn1-rl1)**2))
         mae1 = torch.mean(torch.abs(mn1-rl1))
@@ -778,8 +778,8 @@ def Evaluation3(tickers,freq,gen,test, val, h,l,pred,hid_d,hid_g, z_dim, lrg, lr
         # print("Annualised (val) SR_w : ",SR1*np.sqrt(252 * freq))
         # print("Annualised (val) SR_m : ", np.sqrt(252 * freq) * getSR(ft1,rl1).item())
         
-        means = np.array(mn1.detach())
-        reals = np.array(rl1.detach())
+        means = np.array(mn1.detach().cpu())
+        reals = np.array(rl1.detach().cpu())
         dt['Corr val'] = np.corrcoef([means,reals])[0,1]
         dt['Pos mn val'] = np.sum(means >0)/ len(means)
         dt['Neg mn val'] = np.sum(means <0)/ len(means)
@@ -3034,7 +3034,7 @@ def Evaluation2LSTM(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z
     #print("MAE: ",mae)
     b1 = fake1[0,:,0]
     mn1 = b1
-    real1 = test_data[:,-1]
+    real1 = test_data[:,-1].to(device)
     rl1 = real1.squeeze()
 
     rmse1 = torch.sqrt(torch.mean((mn1-rl1)**2))
@@ -3045,7 +3045,7 @@ def Evaluation2LSTM(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z
     ft1 = mn1.clone().detach().to(device)
     PnL1 = getPnL(ft1,rl1,ntest)
     #print("PnL in bp", PnL)
-    PnLs = 10000 * np.sign(np.array(ft1.detach())) * np.array(rl1.detach())
+    PnLs = 10000 * np.sign(np.array(ft1.detach().cpu())) * np.array(rl1.detach().cpu())
     PnLd = np.zeros(int(0.5*len(PnLs)))
     PnL_even = np.zeros(int(0.5*len(PnLs)))
     PnL_odd = np.zeros(int(0.5*len(PnLs)))
@@ -3069,8 +3069,8 @@ def Evaluation2LSTM(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z
     else:
         dt['Open-to-Close SR_w'] = np.sqrt(252) * np.mean(PnL_even) / np.std(PnL_even)
         dt['Close-to-Open SR_w'] = np.sqrt(252) * np.mean(PnL_odd) / np.std(PnL_odd)
-    means = np.array(mn1.detach())
-    reals = np.array(rl1.detach())
+    means = np.array(mn1.detach().cpu())
+    reals = np.array(rl1.detach().cpu())
     dt['Corr'] = np.corrcoef([means,reals])[0,1]
     print('Correlation ', np.corrcoef([means,reals])[0,1])
     dt['Pos mn'] = np.sum(means >0)/ len(means)
@@ -3093,7 +3093,7 @@ def Evaluation2LSTM(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z
     #print("MAE: ",mae)
     b1 = fake1[0,:,0]
     mn1 = b1
-    real1 = val_data[:,-1]
+    real1 = val_data[:,-1].to(device)
     rl1 = real1.squeeze()
     rmse1 = torch.sqrt(torch.mean((mn1-rl1)**2))
     mae1 = torch.mean(torch.abs(mn1-rl1))
@@ -3101,7 +3101,7 @@ def Evaluation2LSTM(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z
     dt['RMSE val'] = rmse1.item()
     dt['MAE val'] = mae1.item()
     ft1 = mn1.clone().detach().to(device)
-    PnLs = 10000 * np.sign(np.array(ft1.detach())) * np.array(rl1.detach())
+    PnLs = 10000 * np.sign(np.array(ft1.detach().cpu())) * np.array(rl1.detach().cpu())
     PnLd = np.zeros(int(0.5*len(PnLs)))
     for i1 in range(len(PnLd)):
         PnLd[i1] = PnLs[2*i1] + PnLs[2*i1+1]
@@ -3114,8 +3114,8 @@ def Evaluation2LSTM(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z
     
     
     print("Annualised (val) SR_m : ", np.sqrt(252 * freq) * getSR(ft1,rl1).item())
-    means = np.array(mn1.detach())
-    reals = np.array(rl1.detach())
+    means = np.array(mn1.detach().cpu())
+    reals = np.array(rl1.detach().cpu())
     dt['Corr val'] = np.corrcoef([means,reals])[0,1]
     dt['Pos mn val'] = np.sum(means >0)/ len(means)
     dt['Neg mn val'] = np.sum(means <0)/ len(means)
