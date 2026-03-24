@@ -10,10 +10,10 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.1-pro-high")
 
 # ── Paths ───────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FLOWFM_DIR = os.path.join(os.path.dirname(BASE_DIR), "FlowFM")
-FLOWFM_REPO_DIR = os.path.join(os.path.dirname(BASE_DIR), "FlowFM_repo")
+REPO_DIR = os.path.dirname(BASE_DIR)  # FlowFM_repo root (where FinGAN.py lives)
+FLOWFM_DIR = os.path.join(os.path.dirname(REPO_DIR), "FlowFM")  # Google Drive data/checkpoints
 DATA_DIR = os.path.join(FLOWFM_DIR, "data") + "/"  # FinGAN.py concatenates dataloc+ticker+".csv"
-ETF_LIST = os.path.join(FLOWFM_REPO_DIR, "stocks-etfs-list.csv")
+ETF_LIST = os.path.join(REPO_DIR, "stocks-etfs-list.csv")
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 LOSSES_DIR = os.path.join(BASE_DIR, "losses")
 

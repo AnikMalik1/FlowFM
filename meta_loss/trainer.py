@@ -8,8 +8,8 @@ import numpy as np
 import torch
 import torch.optim as optim
 
-# Add FlowFM_repo (GitHub clone) to path for FinGAN/flow_adapter code
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "FlowFM_repo"))
+# Add repo root (parent of meta_loss/) to path for FinGAN/flow_adapter code
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import FinGAN
 from flow_adapter_aux import CondFlowNet, FlowGenAdapter, EMA, fm_sample_from_x0
