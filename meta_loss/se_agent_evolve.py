@@ -417,7 +417,7 @@ def run_se_agent(
     n_initial: int = 5,
     n_seeds: int = 3,
     device=None,
-    results_dir: str = "results/se_agent_v3",
+    results_dir: str = "results/se_agent_v4",
     verbose: bool = True,
     resume_path: str = None,
 ):
@@ -631,7 +631,7 @@ def run_se_agent(
     print(f"{'='*60}")
     print(f"\nWinner loss code:\n{winner['code']}")
 
-    final_path = os.path.join(results_dir, "se_agent_v4_final.json")
+    final_path = os.path.join(results_dir, "final.json")
     with open(final_path, "w") as f:
         json.dump({
             "cycle": n_cycles,
