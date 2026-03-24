@@ -14,10 +14,11 @@ import FinGAN
 from flow_adapter_aux import CondFlowNet, fm_batch_loss, FlowGenAdapter, EMA
 from run_flowfm_aux_31 import load_data_for_ticker, make_model
 
-MODEL_TAG = "FlowFM_10loss"
+_cfg_name = os.environ.get("FLOWFM_CONFIG", "medium")
+MODEL_TAG = f"FlowFM_10loss_{_cfg_name}"
 dataloc = "/projects/s5e/quant/fingan/FlowFM/data/"
 etflistloc = "/projects/s5e/quant/fingan/FlowFM_repo/stocks-etfs-list.csv"
-loc = "/projects/s5e/quant/fingan/FlowFM/FlowFM-10loss/"
+loc = f"/projects/s5e/quant/fingan/FlowFM/FlowFM-10loss-{_cfg_name}/"
 
 TICKERS = [
     "AMZN","HD","NKE","CL","EL","KO","PEP","APA","OXY",
@@ -118,14 +119,25 @@ def fast_val_sr(model, val_data, l, mu_cond, sd_cond, mu_x, sd_x, dev, nsamp=64,
     return (mu_pnl / sd_pnl) * np.sqrt(252.0)
 
 
+MODEL_CONFIGS = {
+    "small":  {"hidden": 32, "depth": 2},   # 16K params
+    "medium": {"hidden": 64, "depth": 2},   # 25K params (recommended)
+    "large":  {"hidden": 64, "depth": 4},   # 51K params
+}
+
+# Select via env var: FLOWFM_CONFIG=small|medium|large (default: medium)
+ACTIVE_CONFIG = os.environ.get("FLOWFM_CONFIG", "medium")
+
+
 def train_one(gpu_id, ticker, ti):
     assert torch.cuda.is_available()
     torch.cuda.set_device(gpu_id)
     dev = torch.device(f"cuda:{gpu_id}")
 
+    cfg = MODEL_CONFIGS[ACTIVE_CONFIG]
     l, h, pred, tr, vl = 10, 1, 1, 0.8, 0.1
     max_epochs, lr = 200, 3e-4
-    hidden, depth, dropout = 256, 4, 0.05
+    hidden, depth, dropout = cfg["hidden"], cfg["depth"], 0.05
     ema_decay, cond_noise_std = 0.999, 0.02
     eval_every, patience_evals = 10, 8
 
@@ -254,6 +266,8 @@ if __name__ == "__main__":
         os.makedirs(os.path.join(loc, d), exist_ok=True)
 
     n_gpus = int(os.environ.get("SLURM_GPUS_ON_NODE", 4))
+    cfg = MODEL_CONFIGS[ACTIVE_CONFIG]
+    print(f"Config: {ACTIVE_CONFIG} (H={cfg['hidden']}, D={cfg['depth']})", flush=True)
     print(f"GPUs: {n_gpus}, Tickers: {len(TICKERS)}, Loss variants: {len(LOSS_FUNCTIONS)}", flush=True)
     print(f"Total models: {len(TICKERS) * len(LOSS_FUNCTIONS)}", flush=True)
 

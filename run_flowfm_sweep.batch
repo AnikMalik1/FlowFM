@@ -1,0 +1,26 @@
+#!/bin/bash
+#SBATCH --account=brics.s5e
+#SBATCH --partition=workq
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:4
+#SBATCH --time=00:30:00
+#SBATCH --output=/projects/s5e/quant/fingan/logs/flowfm_sweep_%j.out
+#SBATCH --error=/projects/s5e/quant/fingan/logs/flowfm_sweep_%j.err
+
+srun --ntasks-per-node=1 bash -c '
+  source /etc/profile.d/modules.sh 2>/dev/null || true
+  module load cuda/12.6 2>/dev/null || true
+  export PATH="/projects/s5e/quant/miniforge3/bin:$PATH"
+  cd /projects/s5e/quant/fingan/FlowFM_repo
+
+  echo "===== Small (H=32, D=2, 16K params) ====="
+  FLOWFM_CONFIG=small python3 run_flowfm_10loss.py
+
+  echo ""
+  echo "===== Medium (H=64, D=2, 25K params) ====="
+  FLOWFM_CONFIG=medium python3 run_flowfm_10loss.py
+
+  echo ""
+  echo "===== Large (H=64, D=4, 51K params) ====="
+  FLOWFM_CONFIG=large python3 run_flowfm_10loss.py
+'
