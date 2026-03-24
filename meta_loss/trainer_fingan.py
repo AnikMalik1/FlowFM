@@ -30,7 +30,7 @@ def _load_data(ticker, tr=0.8, vl=0.1, h=1, l=10, pred=1):
 
 
 @torch.no_grad()
-def _fast_val_sr_fingan(gen, data, l, z_dim, hid_g, device, mean_val, std_val, nsamp=256):
+def _fast_val_sr_fingan(gen, data, l, z_dim, hid_g, device, nsamp=256):
     """Vectorized val SR for FinGAN generator."""
     gen.eval()
     data = data.to(device).float()
@@ -166,8 +166,7 @@ def train_single_ticker_fingan(
 
         # Eval
         if ep % eval_every == 0:
-            val_sr = _fast_val_sr_fingan(gen, val_t, l, z_dim, hid_g, device,
-                                          mean_val, std_val)
+            val_sr = _fast_val_sr_fingan(gen, val_t, l, z_dim, hid_g, device)
             if verbose:
                 print(f"  {ticker} fingan ep={ep:4d} val_SR={val_sr:.4f}")
             if val_sr > best_val_sr:
