@@ -20,9 +20,8 @@ parser.add_argument("--gpu", type=int, default=0)
 parser.add_argument("--batch_size", type=int, default=10000)
 args = parser.parse_args()
 
-os.makedirs(os.path.join(args.loc, "TrainedModels"), exist_ok=True)
-os.makedirs(os.path.join(args.loc, "Plots"), exist_ok=True)
-os.makedirs(os.path.join(args.loc, "Results"), exist_ok=True)
+for d in ["TrainedModels", "Plots", "Results", "PnLs"]:
+    os.makedirs(os.path.join(args.loc, d), exist_ok=True)
 
 t0 = time.time()
 df, corr = FinGAN.FinGAN_combos(
