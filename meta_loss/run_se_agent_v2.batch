@@ -12,8 +12,9 @@
 set -euo pipefail
 
 # ── Conda ───────────────────────────────────────────────
-source /projects/s5e/quant/miniforge3/etc/profile.d/conda.sh 2>/dev/null || true
+# conda.sh has stale hardcoded paths; use conda binary directly
 export PATH="/projects/s5e/quant/miniforge3/bin:$PATH"
+eval "$(/projects/s5e/quant/miniforge3/bin/conda shell.bash hook 2>/dev/null)"
 conda activate base
 
 # ── Antigravity Manager (LLM API proxy) ────────────────
