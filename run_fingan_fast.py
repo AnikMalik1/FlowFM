@@ -3,7 +3,7 @@ import os, sys, time, numpy as np, torch, torch.optim as optim, torch.nn as nn
 import torch.multiprocessing as mp
 import pandas as pd
 
-assert torch.cuda.is_available(), "CUDA NOT AVAILABLE"
+# CUDA check is done in each worker (after CUDA_VISIBLE_DEVICES is set)
 
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -27,8 +27,10 @@ TICKERS = [
 
 
 def train_ticker(gpu_id, ticker, ti):
-    torch.cuda.set_device(gpu_id)
-    dev = torch.device(f"cuda:{gpu_id}")
+    # FinGAN_combos hardcodes cuda:0, so use CUDA_VISIBLE_DEVICES
+    # to make each process see only its assigned GPU as cuda:0
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    torch.cuda.set_device(0)  # always 0 after CUDA_VISIBLE_DEVICES remap
     torch.manual_seed(42 + ti)
 
     t0 = time.time()
@@ -90,7 +92,7 @@ if __name__ == "__main__":
     for d in ["PnLs", "Results", "Plots", "TrainedModels"]:
         os.makedirs(os.path.join(loc, d), exist_ok=True)
 
-    n_gpus = torch.cuda.device_count()
+    n_gpus = int(os.environ.get("SLURM_GPUS_ON_NODE", 4))
     print(f"GPUs: {n_gpus}, Tickers: {len(TICKERS)}", flush=True)
     print(f"Total models: {len(TICKERS)} × 10 loss variants = {len(TICKERS)*10}", flush=True)
 
