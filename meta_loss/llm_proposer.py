@@ -1,6 +1,9 @@
 """
 LLM Proposer — uses OpenAI-compatible API to propose new loss functions.
+
+v2: Includes top-K source code in prompt + diversity pressure.
 """
+import os
 import json
 from typing import Optional
 
@@ -14,6 +17,7 @@ Conditional Flow Matching model that learns a velocity field v(x_t, condition, t
 - Base training loss: MSE(v_pred, v_target) where v_target = x1 - x0
 - x0 ~ N(0,1) is noise, x1 is the real return (normalized)
 - x_t = (1-t)*x0 + t*x1 is the noisy interpolation
+- x_pred = x_t + (1-t)*v_pred is the first-order extrapolation to t=1
 - At inference: ODE integration from t=0 to t=1 generates samples
 
 ## Loss Function Interface
@@ -21,7 +25,7 @@ Conditional Flow Matching model that learns a velocity field v(x_t, condition, t
 def loss_fn(v_pred, v_target, x_pred, x_real, condition, epoch):
     # v_pred:    (B,1) predicted velocity
     # v_target:  (B,1) true velocity = x1 - x0
-    # x_pred:    (B,1) one-step approx of generated sample = x0 + v_pred
+    # x_pred:    (B,1) first-order extrapolation = x_t + (1-t)*v_pred
     # x_real:    (B,1) true normalized return
     # condition: (B,l) lookback window of past normalized returns
     # epoch:     int, current training epoch
@@ -34,6 +38,7 @@ def loss_fn(v_pred, v_target, x_pred, x_real, condition, epoch):
 - mse_term = MSE(x_pred, x_real)  — prediction accuracy
 - sharpe_term = mean(pnl) / std(pnl)  — mini-batch Sharpe
 - std_term = std(tanh(100*x_pred) * x_real)  — PnL volatility
+- sortino_term = mean(pnl) / sqrt(mean(relu(-pnl)^2))  — downside risk
 
 ## Rules
 1. MUST include velocity_loss = F.mse_loss(v_pred, v_target) as base term
@@ -42,7 +47,8 @@ def loss_fn(v_pred, v_target, x_pred, x_real, condition, epoch):
 4. Can use: torch.*, torch.nn.functional.*, math.*
 5. Can create new terms not in the list above
 6. Can use epoch for curriculum/scheduling
-7. Function name MUST be loss_fn
+7. Can use condition tensor for context-aware losses
+8. Function name MUST be loss_fn
 
 ## Output Format
 First explain your reasoning (2-3 sentences), then output ONLY the Python code block:
@@ -66,12 +72,53 @@ def build_history_table(results: list[dict]) -> str:
     lines = ["| Rank | Loss Name | Mean SR | Stage | Description |",
              "|------|-----------|---------|-------|-------------|"]
 
-    for i, r in enumerate(sorted_r[:15]):  # top 15
+    for i, r in enumerate(sorted_r[:15]):
         name = r.get("loss_name", "?")
         sr = r.get("mean_sr", 0)
         stage = r.get("stage", "?")
         desc = r.get("description", "")[:60]
         lines.append(f"| {i+1} | {name} | {sr:.4f} | S{stage} | {desc} |")
+
+    return "\n".join(lines)
+
+
+def build_top_k_code(results: list[dict], k: int = 3) -> str:
+    """Include source code of top-K losses so LLM can learn from winners."""
+    sorted_r = sorted(results, key=lambda x: -x.get("mean_sr", -999))
+    blocks = []
+
+    for r in sorted_r[:k]:
+        name = r.get("loss_name", "?")
+        sr = r.get("mean_sr", 0)
+        code = r.get("code", "")
+
+        # If no code in results, try reading from file
+        if not code:
+            path = os.path.join(config.LOSSES_DIR, f"{name}.py")
+            if os.path.exists(path):
+                with open(path) as f:
+                    code = f.read()
+
+        if code:
+            blocks.append(f"### {name} (SR={sr:.4f})\n```python\n{code}\n```")
+
+    return "\n\n".join(blocks) if blocks else "No source code available."
+
+
+def build_failed_patterns(results: list[dict]) -> str:
+    """Summarize patterns that didn't work, so LLM avoids them."""
+    sorted_r = sorted(results, key=lambda x: x.get("mean_sr", -999))
+    failures = [r for r in sorted_r if r.get("mean_sr", 0) < 0.9 and r.get("origin") == "llm"]
+
+    if not failures:
+        return ""
+
+    lines = ["\n## Patterns That Did NOT Work (avoid these):"]
+    for r in failures[:5]:
+        name = r.get("loss_name", "?")
+        sr = r.get("mean_sr", 0)
+        reasoning = r.get("reasoning", "")[:100]
+        lines.append(f"- **{name}** (SR={sr:.3f}): {reasoning}")
 
     return "\n".join(lines)
 
@@ -95,11 +142,40 @@ def propose_loss(history: list[dict], round_num: int) -> dict:
     )
 
     history_table = build_history_table(history)
+    top_k_code = build_top_k_code(history, k=3)
+    failed_patterns = build_failed_patterns(history)
+
+    # Count how many evolved losses exist
+    n_evolved = sum(1 for r in history if r.get("origin") == "llm")
+
+    # Diversity pressure: after 3 failed rounds, explicitly demand novelty
+    diversity_hint = ""
+    if n_evolved >= 3:
+        recent_names = [r.get("loss_name", "") for r in history if r.get("origin") == "llm"][-5:]
+        diversity_hint = f"""
+## IMPORTANT: Diversity Required
+You have already proposed {n_evolved} losses. Recent attempts: {', '.join(recent_names)}.
+These all follow similar patterns (curriculum + sortino variants).
+You MUST try a fundamentally different approach. Consider:
+- Using the `condition` tensor (lookback returns) for context-aware weighting
+- Contrastive losses (positive vs negative return separation)
+- Quantile-based losses instead of mean-based
+- Volatility regime detection from condition
+- Asymmetric loss weights based on predicted confidence
+- Huber/quantile regression on returns instead of MSE
+- Direct optimization of win rate or hit ratio
+- Momentum-aware losses using condition autocorrelation
+Do NOT propose another curriculum_sortino variant."""
 
     user_msg = f"""## Evolution Round {round_num}
 
 ## Previous Results (sorted by mean per-ticker Sharpe Ratio):
 {history_table}
+
+## Source Code of Top-3 Losses (learn from what works):
+{top_k_code}
+{failed_patterns}
+{diversity_hint}
 
 ## Task
 Propose a NEW loss function that improves mean per-ticker Sharpe Ratio.
@@ -154,11 +230,9 @@ def _extract_code_block(text: str) -> str:
 def _extract_name(text: str) -> str:
     """Extract loss function name from response."""
     import re
-    # Look for "Name: xxx" or "name: xxx"
     m = re.search(r'[Nn]ame[:\s]+[`"]*(\w+)[`"]*', text)
     if m:
         return m.group(1)
-    # Look for "def loss_fn" — use a generic name
     return f"evolved_{hash(text) % 10000:04d}"
 
 
