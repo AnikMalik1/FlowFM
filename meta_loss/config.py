@@ -58,6 +58,16 @@ VAL_MC_CHUNK = 8
 FINAL_MC_SAMPLES = 1000
 FINAL_MC_CHUNK = 8
 
+# ── Meta-Learning Train/Val/Test Split ─────────────────
+# Train: used during evolution inner loop (LLM feedback signal)
+# Val:   held-out, used ONLY after evolution to select best checkpoint
+# Test:  full STAGE2, fair comparison (only run once for final report)
+META_TRAIN_TICKERS = ["AMZN", "BLK", "HD", "NKE", "CL", "KO", "APA", "OXY", "WFC", "GS"]
+META_VAL_TICKERS = ["PFE", "FDX", "IBM", "ECL", "DTE"]
+META_TEST_TICKERS = STAGE2_TICKERS  # full 30 tickers
+META_TRAIN_SEEDS = 2   # faster inner loop (2 seeds x 10 tickers)
+META_VAL_SEEDS = 3     # more robust checkpoint selection
+
 # ── Evolution ───────────────────────────────────────────
 MAX_ROUNDS = 30
-STAGE2_PROMOTION_TOP_K = 3  # promote to Stage 2 if SR > top-K threshold
+STAGE2_PROMOTION_TOP_K = 3

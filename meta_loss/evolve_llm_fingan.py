@@ -163,8 +163,8 @@ def _parse_response(text):
 
 # ── Evaluation ───────────────────────────────────────────
 
-def evaluate_fingan(code, name, device, n_seeds=3):
-    """Load loss, validate, train on 3 tickers x n_seeds seeds."""
+def evaluate_fingan(code, name, device, n_seeds=3, tickers=None):
+    """Load loss, validate, train on tickers x n_seeds seeds."""
     name = _sanitize_name(name)
     err = _scan_code_safety(code)
     if err:
@@ -190,10 +190,12 @@ def evaluate_fingan(code, name, device, n_seeds=3):
     except Exception as e:
         return {"loss_name": name, "mean_sr": -999, "error": f"validate: {e}", "code": code}
 
-    # Train on 3 tickers x n_seeds seeds
+    # Train on tickers x n_seeds seeds
+    if tickers is None:
+        tickers = config.META_TRAIN_TICKERS
     seeds = list(range(42, 42 + n_seeds))
     per_ticker = {}
-    for ticker in config.STAGE1_TICKERS:
+    for ticker in tickers:
         sr_per_seed = []
         for seed in seeds:
             try:
@@ -231,7 +233,7 @@ def main():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    results_dir = os.path.join(config.RESULTS_DIR, "llm_fingan_v3")
+    results_dir = os.path.join(config.RESULTS_DIR, "llm_fingan_v4")
     os.makedirs(results_dir, exist_ok=True)
 
     all_results = []
@@ -368,21 +370,54 @@ def main():
         with open(os.path.join(results_dir, "messages.json"), "w") as f:
             json.dump(messages, f, indent=2, default=str)
 
-    # ── Final leaderboard ────────────────────────────────
+    # ── Train leaderboard ────────────────────────────────
     sorted_r = sorted(all_results, key=lambda x: -x.get("mean_sr", -999))
     print(f"\n{'='*60}")
-    print(f"{'LLM+CONVERSATION v2 FINAL':^60}")
+    print(f"{'TRAIN LEADERBOARD':^60}")
     print(f"{'='*60}")
-    for i, r in enumerate(sorted_r[:20]):
+    for i, r in enumerate(sorted_r[:10]):
         norm = r.get("mean_sr", 0) / baseline_sr
         key = r.get("loss_name", r.get("name", "?"))
         print(f"  {i+1}. {key:25s} SR={r.get('mean_sr',0):.4f} (norm={norm:.3f}) ({r.get('origin','?')})")
 
-    with open(os.path.join(results_dir, "final.json"), "w") as f:
+    # ── Validation Phase: held-out tickers ────────────────
+    print(f"\n{'='*60}")
+    print(f"  VALIDATION PHASE (held-out tickers: {config.META_VAL_TICKERS})")
+    print(f"{'='*60}")
+    # Take top-5 unique losses (skip baselines, only LLM proposals)
+    llm_only = [r for r in sorted_r if r.get("origin") == "llm" and r.get("mean_sr", -999) > -900]
+    top5_llm = llm_only[:5]
+    val_results = []
+    for r in top5_llm:
+        name = r.get("loss_name", r.get("name", "?"))
+        code = r.get("code", "")
+        print(f"\n  Validating: {name} (train_SR={r['mean_sr']:.4f})")
+        vr = evaluate_fingan(code, f"val_{name}", device,
+                             n_seeds=config.META_VAL_SEEDS,
+                             tickers=config.META_VAL_TICKERS)
+        val_results.append({"name": name, "train_sr": r["mean_sr"],
+                            "val_sr": vr["mean_sr"], "code": code})
+        print(f"  val_SR = {vr['mean_sr']:.4f} (train_SR was {r['mean_sr']:.4f})")
+
+    val_results.sort(key=lambda x: -x.get("val_sr", -999))
+    print(f"\n--- Validation Leaderboard ---")
+    for i, vr in enumerate(val_results):
+        val_norm = vr["val_sr"] / baseline_sr if baseline_sr > 0 else 0
+        print(f"  {i+1}. val_SR={vr['val_sr']:.4f} (norm={val_norm:.3f}) "
+              f"| train_SR={vr['train_sr']:.4f} | {vr['name']}")
+
+    winner = val_results[0] if val_results else {"name": "none", "val_sr": -999, "train_sr": -999}
+    print(f"\n  Winner (by val_SR): {winner['name']}")
+    print(f"    val_SR={winner['val_sr']:.4f}, train_SR={winner['train_sr']:.4f}")
+
+    with open(os.path.join(results_dir, "final_v4.json"), "w") as f:
         json.dump({
             "baseline_sr": baseline_sr,
             "n_seeds": n_seeds,
-            "results": sorted_r[:50],
+            "winner": winner,
+            "validation_results": val_results,
+            "train_results": [{k: v for k, v in r.items() if k != "code"}
+                              for r in sorted_r[:20]],
         }, f, indent=2, default=str)
 
 

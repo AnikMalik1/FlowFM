@@ -150,8 +150,9 @@ When you respond, output a JSON object with exactly three keys:
 # ── Evaluation ───────────────────────────────────────────
 
 def evaluate_loss(code: str, name: str, registry: LossRegistry, device,
-                  n_seeds: int = 3, baseline_sr: float = 1.0) -> dict:
-    """Load loss_fn from code, validate, evaluate on 3 tickers x n_seeds seeds."""
+                  n_seeds: int = 3, baseline_sr: float = 1.0,
+                  tickers: list = None) -> dict:
+    """Load loss_fn from code, validate, evaluate on tickers x n_seeds seeds."""
     from loss_registry import _scan_code_safety, _sanitize_name
     import importlib.util
 
@@ -183,10 +184,12 @@ def evaluate_loss(code: str, name: str, registry: LossRegistry, device,
     except Exception as e:
         return {"name": name, "sr": -999, "norm_sr": -999, "error": f"validate: {e}", "code": code}
 
-    # Evaluate on FinGAN: 3 tickers x n_seeds seeds
+    # Evaluate on FinGAN
+    if tickers is None:
+        tickers = config.META_TRAIN_TICKERS
     seeds = list(range(42, 42 + n_seeds))
     results = {}
-    for ticker in config.STAGE1_TICKERS:
+    for ticker in tickers:
         sr_per_seed = []
         for seed in seeds:
             try:
@@ -334,28 +337,55 @@ def transfer(target: dict, references: list[dict]) -> dict:
     }
 
 
-def restructure(pool: list[dict]) -> dict:
-    """Global restructuring: synthesize from entire pool."""
+def restructure(pool: list[dict], mode: str = "global") -> dict:
+    """Restructure: synthesize new loss from pool. 3 modes for diversity."""
+    sorted_pool = sorted(pool, key=lambda x: -x.get("sr", -999))
     pool_text = "\n\n".join(
         f"### {c['name']} (SR={c.get('sr', '?')}, norm={c.get('norm_sr', '?')})\n```python\n{c['code']}\n```"
-        for c in sorted(pool, key=lambda x: -x.get("sr", -999))[:5]
+        for c in sorted_pool[:5]
     )
 
-    prompt = (
-        f"Synthesize a new loss function from global analysis of this pool.\n\n"
-        f"## Loss Function Pool (top 5)\n{pool_text}\n\n"
-        f"## Task\n"
-        f"1. Find abstract patterns across ALL successful losses\n"
-        f"2. Identify what the best losses share\n"
-        f"3. Create a NEW loss that captures these patterns in a novel way\n"
-        f"4. Don't copy any single loss -- synthesize\n\n"
-        f'Respond with JSON: {{"thought": "...", "name": "...", "code": "..."}}'
-    )
+    if mode == "contrast":
+        best = sorted_pool[0]
+        worst = sorted_pool[-1] if sorted_pool[-1].get("sr", -999) > -900 else sorted_pool[-2]
+        prompt = (
+            f"Compare the BEST and WORST loss functions. Extract what makes the difference.\n\n"
+            f"## Best: {best['name']} (SR={best.get('sr', '?')})\n```python\n{best['code']}\n```\n\n"
+            f"## Worst: {worst['name']} (SR={worst.get('sr', '?')})\n```python\n{worst['code']}\n```\n\n"
+            f"## Task\n"
+            f"1. WHY does the best work and worst fail? Be specific about mechanisms.\n"
+            f"2. Create a NEW loss that maximizes the good and avoids the bad.\n\n"
+            f'Respond with JSON: {{"thought": "...", "name": "...", "code": "..."}}'
+        )
+    elif mode == "novel":
+        prompt = (
+            f"Here are the current best losses:\n\n{pool_text}\n\n"
+            f"## Task\n"
+            f"All existing losses use variations of PnL, Sharpe, MSE, STD.\n"
+            f"Create something GENUINELY NEW that no existing loss does:\n"
+            f"- Consider information-theoretic measures (mutual information, entropy)\n"
+            f"- Consider distributional matching (Wasserstein, MMD)\n"
+            f"- Consider higher-order moments (skewness, kurtosis of PnL)\n"
+            f"- Consider regime-adaptive weighting\n"
+            f"Must still be differentiable and use the loss_fn(gen_out, real, tanh_temp) interface.\n\n"
+            f'Respond with JSON: {{"thought": "...", "name": "...", "code": "..."}}'
+        )
+    else:  # global (default)
+        prompt = (
+            f"Synthesize a new loss function from global analysis of this pool.\n\n"
+            f"## Loss Function Pool (top 5)\n{pool_text}\n\n"
+            f"## Task\n"
+            f"1. Find abstract patterns across ALL successful losses\n"
+            f"2. Identify what the best losses share\n"
+            f"3. Create a NEW loss that captures these patterns in a novel way\n"
+            f"4. Don't copy any single loss -- synthesize\n\n"
+            f'Respond with JSON: {{"thought": "...", "name": "...", "code": "..."}}'
+        )
 
     text = _llm_call(LOSS_SYSTEM, prompt)
     parsed = _parse_response(text)
     return {
-        "name": f"restructure_{len(pool)}",
+        "name": f"restructure_{mode}_{len(pool)}",
         "code": parsed["code"],
         "thought": parsed.get("thought", ""),
         "reasoning": parsed.get("thought", text[:300]),
@@ -495,9 +525,9 @@ def run_se_agent(
 
         new_candidates = []
 
-        # ── Revision: reflect + revise each candidate ────
-        print(f"\n--- Revision ---")
-        for cand in select_elite(population, k=3):
+        # ── Revision: only best-1 (was 3, reduced to avoid crashes) ──
+        print(f"\n--- Revision (best-1 only) ---")
+        for cand in select_elite(population, k=1):
             if cand.get("sr", -999) <= -900:
                 continue
             result = next((r for r in all_results if r["name"] == cand["name"]), None)
@@ -505,10 +535,8 @@ def run_se_agent(
                 revised = reflect_and_revise(cand, result, baseline_sr)
                 new_candidates.append(revised)
                 print(f"  Revised {cand['name']} -> {revised['name']}")
-                if revised.get("thought"):
-                    print(f"    Thought: {revised['thought'][:150]}...")
 
-        # ── Recombination: crossover top pairs ───────────
+        # ── Recombination: crossover + transfer ───────────
         print(f"\n--- Recombination ---")
         elite = select_elite(population, k=4)
         if len(elite) >= 2:
@@ -521,9 +549,12 @@ def run_se_agent(
                 new_candidates.append(transferred)
                 print(f"  Transfer: top-2 -> {transferred['name']}")
 
-            restructured = restructure(population)
+        # ── Restructure x3 (global, contrast, novel) ─────
+        print(f"\n--- Restructure x3 ---")
+        for mode in ["global", "contrast", "novel"]:
+            restructured = restructure(population, mode=mode)
             new_candidates.append(restructured)
-            print(f"  Restructure: pool -> {restructured['name']}")
+            print(f"  Restructure ({mode}): -> {restructured['name']}")
 
         # ── Evaluate all new candidates ──────────────────
         print(f"\n--- Evaluate {len(new_candidates)} new candidates ---")
@@ -564,28 +595,54 @@ def run_se_agent(
                                     "norm_sr": c.get("norm_sr")} for c in new_candidates],
             }, f, indent=2, default=str)
 
-    # Final
-    best = max(population, key=lambda x: x.get("sr", -999))
-    best_norm = best.get("sr", 0) / baseline_sr if baseline_sr > 0 else 0
+    # ── Validation Phase: held-out tickers ─────────────────
     print(f"\n{'='*60}")
-    print(f"  SE-Agent v3 COMPLETE")
-    print(f"  Best: {best['name']} SR={best.get('sr',-999):.4f} (norm={best_norm:.3f})")
-    print(f"  Total evaluations: {len(all_results)}")
+    print(f"  VALIDATION PHASE (held-out tickers: {config.META_VAL_TICKERS})")
     print(f"{'='*60}")
-    print(f"\nBest loss code:\n{best['code']}")
+    top5 = select_elite(population, k=5)
+    val_results = []
+    for cand in top5:
+        print(f"\n  Validating: {cand['name']} (train_SR={cand.get('sr', -999):.4f})")
+        vr = evaluate_loss(cand["code"], f"val_{cand['name']}", registry, device,
+                           n_seeds=config.META_VAL_SEEDS, baseline_sr=baseline_sr,
+                           tickers=config.META_VAL_TICKERS)
+        val_results.append({"name": cand["name"], "train_sr": cand.get("sr"),
+                            "val_sr": vr["sr"], "val_per_ticker": vr.get("per_ticker", {}),
+                            "code": cand["code"]})
+        print(f"  val_SR = {vr['sr']:.4f} (train_SR was {cand.get('sr', -999):.4f})")
 
-    final_path = os.path.join(results_dir, "se_agent_v3_final.json")
+    val_results.sort(key=lambda x: -x.get("val_sr", -999))
+    print(f"\n--- Validation Leaderboard ---")
+    for i, vr in enumerate(val_results):
+        val_norm = vr["val_sr"] / baseline_sr if baseline_sr > 0 else 0
+        print(f"  {i+1}. val_SR={vr['val_sr']:.4f} (norm={val_norm:.3f}) "
+              f"| train_SR={vr['train_sr']:.4f} | {vr['name']}")
+
+    winner = val_results[0]
+    winner_norm = winner["val_sr"] / baseline_sr if baseline_sr > 0 else 0
+
+    # Final
+    print(f"\n{'='*60}")
+    print(f"  SE-Agent v4 COMPLETE")
+    print(f"  Winner (by val_SR): {winner['name']}")
+    print(f"    val_SR={winner['val_sr']:.4f} (norm={winner_norm:.3f})")
+    print(f"    train_SR={winner['train_sr']:.4f}")
+    print(f"  Total train evaluations: {len(all_results)}")
+    print(f"{'='*60}")
+    print(f"\nWinner loss code:\n{winner['code']}")
+
+    final_path = os.path.join(results_dir, "se_agent_v4_final.json")
     with open(final_path, "w") as f:
         json.dump({
             "cycle": n_cycles,
             "baseline_sr": baseline_sr,
-            "best": {"name": best["name"], "sr": best.get("sr"),
-                     "norm_sr": best_norm, "code": best["code"]},
-            "all_results": [{"name": r["name"], "sr": r.get("sr", r.get("mean_sr")),
-                             "norm_sr": r.get("norm_sr")} for r in all_results],
-            "population": [{"name": c["name"], "sr": c.get("sr"),
-                            "norm_sr": c.get("norm_sr"), "code": c["code"]}
-                           for c in population],
+            "winner": winner,
+            "validation_results": val_results,
+            "all_train_results": [{"name": r["name"], "sr": r.get("sr", r.get("mean_sr")),
+                                   "norm_sr": r.get("norm_sr")} for r in all_results],
+            "final_population": [{"name": c["name"], "sr": c.get("sr"),
+                                  "norm_sr": c.get("norm_sr"), "code": c["code"]}
+                                 for c in population],
         }, f, indent=2, default=str)
 
     return all_results
