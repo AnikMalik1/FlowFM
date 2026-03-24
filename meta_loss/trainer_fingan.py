@@ -175,7 +175,6 @@ def train_single_ticker_fingan(
 
     l = config.LOOKBACK
     z_dim, hid_g, hid_d = 8, 8, 8
-    batch_size = 100
     tanh_temp = 100.0
 
     torch.manual_seed(42)
@@ -186,8 +185,9 @@ def train_single_ticker_fingan(
     val_t = torch.from_numpy(val_np).float().to(device)
 
     N = train_t.shape[0]
-    ref_mean = train_t[:batch_size].mean()
-    ref_std = train_t[:batch_size].std()
+    batch_size = N  # BSZ=N: entire dataset in one batch (6 MB on 85 GB GPU)
+    ref_mean = train_t[:100].mean()  # match original: first 100 samples for normalization
+    ref_std = train_t[:100].std()
 
     gen = FinGAN.Generator(noise_dim=z_dim, cond_dim=l, hidden_dim=hid_g,
                            output_dim=1, mean=ref_mean, std=ref_std).to(device)
