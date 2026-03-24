@@ -2,8 +2,6 @@
 import os, sys, time, numpy as np, torch, torch.optim as optim
 import torch.multiprocessing as mp
 
-assert torch.cuda.is_available(), "CUDA NOT AVAILABLE"
-
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 plt.ioff(); plt.show = lambda *a, **k: None
@@ -25,6 +23,7 @@ for d in ["PnLs", "Results", "Plots", "TrainedModels"]:
 
 
 def train_one(gpu_id, ticker, ti):
+    assert torch.cuda.is_available(), f"CUDA not available on GPU {gpu_id}"
     torch.cuda.set_device(gpu_id)
     dev = torch.device(f"cuda:{gpu_id}")
     torch.manual_seed(1000 + ti)
@@ -160,6 +159,7 @@ def worker(gpu_id, assignments):
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn")
     TICKERS = ["AMZN", "APA", "BLK", "PFE", "HD", "NKE", "KO", "GS"]
     n_gpus = torch.cuda.device_count()
     print(f"GPUs: {n_gpus}, Tickers: {len(TICKERS)}", flush=True)
