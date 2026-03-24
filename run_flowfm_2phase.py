@@ -1,9 +1,13 @@
 """
-Two-phase FlowFMPlus: FM pretrain → financial fine-tune (frozen backbone).
-Avoids the FM vs financial loss conflict that makes composite losses fail.
+Two-phase FlowFMPlus v2: FM pretrain → financial fine-tune (partial unfreeze).
 
 Phase 1: Full model trained with velocity MSE (learn distribution shape)
-Phase 2: Freeze backbone, fine-tune output head only with financial loss
+Phase 2: Unfreeze last ResBlock + output head, fine-tune with financial loss (500 ep)
+
+v1 → v2 changes:
+  - Partial unfreeze: blocks[-1] + out (was: out only)
+  - Phase 2 epochs: 500 (was: 100)
+  - Goal: push pu to extremes → higher raw PnL while keeping high SR
 """
 import os, sys, time, math, numpy as np, torch, torch.nn as nn, torch.optim as optim
 import torch.multiprocessing as mp
@@ -25,7 +29,7 @@ _cfg_name = os.environ.get("FLOWFM_CONFIG", "medium")
 MODEL_TAG = f"FlowFM_2phase_{_cfg_name}"
 dataloc = "/projects/s5e/quant/fingan/FlowFM/data/"
 etflistloc = "/projects/s5e/quant/fingan/FlowFM_repo/stocks-etfs-list.csv"
-loc = f"/projects/s5e/quant/fingan/FlowFM/FlowFM-2phase-{_cfg_name}/"
+loc = f"/projects/s5e/quant/fingan/FlowFM/FlowFM-2phase-v2-{_cfg_name}/"
 
 TICKERS = [
     "AMZN","HD","NKE","CL","EL","KO","PEP","APA","OXY",
@@ -117,8 +121,8 @@ def train_one(gpu_id, ticker, ti):
     p1_epochs = 100
     p1_lr = 3e-4
 
-    # Phase 2 config
-    p2_epochs = 100
+    # Phase 2 config (v2: longer + partial unfreeze)
+    p2_epochs = 500
     p2_lr = 1e-4  # lower LR for fine-tuning
 
     train_np, val_np, test_np = load_data_for_ticker(ticker, dataloc, etflistloc, tr, vl, 1, l, 1)
@@ -198,9 +202,11 @@ def train_one(gpu_id, ticker, ti):
         # Restore from Phase 1
         model.load_state_dict(p1_state)
 
-        # Freeze backbone, only train output head
+        # Partial unfreeze: last ResBlock + output head (v2)
+        n_blocks = len(model.blocks)
+        last_block_prefix = f"blocks.{n_blocks - 1}."
         for name, param in model.named_parameters():
-            if "out" in name:
+            if "out" in name or name.startswith(last_block_prefix):
                 param.requires_grad = True
             else:
                 param.requires_grad = False
@@ -218,6 +224,7 @@ def train_one(gpu_id, ticker, ti):
         best_state = None
         evals_since_best = 0
 
+        p2_warmup = max(10, p2_epochs // 50)
         for ep in range(1, p2_epochs + 1):
             model.train()
             perm = torch.randperm(N, device=dev)
@@ -225,7 +232,15 @@ def train_one(gpu_id, ticker, ti):
             x = x1_train[perm]
             x_real = x1_real_train[perm]
 
-            # Forward through full model (frozen backbone + trainable head)
+            # Cosine LR schedule for Phase 2
+            if ep < p2_warmup:
+                lr_mult = ep / p2_warmup
+            else:
+                lr_mult = 0.5 * (1.0 + np.cos(np.pi * (ep - p2_warmup) / max(1, p2_epochs - p2_warmup)))
+            for pg in opt2.param_groups:
+                pg["lr"] = p2_lr * lr_mult
+
+            # Forward through full model (frozen layers + trainable layers)
             B = x.shape[0]
             t = torch.rand((B,), device=dev).clamp(1e-4, 1.0 - 1e-4)
             x0 = torch.randn_like(x)
@@ -235,7 +250,7 @@ def train_one(gpu_id, ticker, ti):
             # Estimated x1 in real space
             x1_hat = (x_t + (1.0 - t)[:, None] * v_pred) * sd_x + mu_x
 
-            # Pure financial loss (no FM loss — backbone is frozen)
+            # Pure financial loss (gradients flow through unfrozen layers)
             opt2.zero_grad(set_to_none=True)
             loss = fin_fn(x1_hat, x_real)
             loss.backward()
@@ -250,7 +265,7 @@ def train_one(gpu_id, ticker, ti):
                     evals_since_best = 0
                 else:
                     evals_since_best += 1
-                    if evals_since_best >= 8:
+                    if evals_since_best >= 15:  # wider patience for 500 epochs
                         break
 
         if best_state is None:
@@ -316,7 +331,7 @@ if __name__ == "__main__":
     cfg = MODEL_CONFIGS[ACTIVE_CONFIG]
     print(f"Config: {ACTIVE_CONFIG} (H={cfg['hidden']}, D={cfg['depth']})", flush=True)
     print(f"GPUs: {n_gpus}, Tickers: {len(TICKERS)}", flush=True)
-    print(f"Phase 1: 100 ep FM pretrain | Phase 2: 100 ep financial fine-tune (output head only)", flush=True)
+    print(f"Phase 1: 100 ep FM pretrain | Phase 2: 500 ep financial fine-tune (last block + out)", flush=True)
     print(f"Financial losses: {len(FIN_LOSSES)} + FM_only = {len(FIN_LOSSES)+1} variants", flush=True)
 
     assignments = [[] for _ in range(n_gpus)]
