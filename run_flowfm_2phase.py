@@ -19,6 +19,7 @@ sys.path.insert(0, "/projects/s5e/quant/fingan/FlowFM_repo")
 import FinGAN
 from flow_adapter_aux import CondFlowNet, fm_batch_loss, FlowGenAdapter, EMA
 from run_flowfm_aux_31 import load_data_for_ticker, make_model
+from eval_gpu import Evaluation2_gpu
 
 _cfg_name = os.environ.get("FLOWFM_CONFIG", "medium")
 MODEL_TAG = f"FlowFM_2phase_{_cfg_name}"
@@ -167,13 +168,29 @@ def train_one(gpu_id, ticker, ti):
     # Save Phase 1 checkpoint (shared base for all Phase 2 variants)
     p1_state = {k: v.detach().clone() for k, v in ema.shadow.items()}
 
-    # Evaluate FM_only (Phase 1 only, no Phase 2)
+    # Evaluate FM_only (Phase 1 only, no Phase 2) with full Evaluation2
     model.load_state_dict(p1_state)
-    p1_val_sr = fast_val_sr(model, val, l, mu_cond, sd_cond, mu_x, sd_x, dev)
-    p1_test_sr = fast_val_sr(model, test, l, mu_cond, sd_cond, mu_x, sd_x, dev)
+    model.eval()
+    gen = FlowGenAdapter(model, mu_cond, sd_cond, mu_x, sd_x, 40, 1).to(dev)
+
+    df_p1, PnL_p1, _, _, _, _, _, _ = Evaluation2_gpu(
+        ticker=ticker, freq=2, gen=gen, test_data=test, val_data=val,
+        h=1, l=l, pred=1, hid_d=8, hid_g=8, z_dim=8,
+        lrg=1e-4, lrd=1e-4, n_epochs=100,
+        losstype="FM_only", sr_val=0, device=dev,
+        plotsloc=os.path.join(loc, "Plots") + "/",
+        f_name=f"{ticker}-FM_only", plot=False, nsamp=1000,
+    )
+    pd.DataFrame(PnL_p1).to_csv(os.path.join(loc, "PnLs", f"{ticker}-FM_only.csv"), index=False, header=False)
+
     results.append({
         "ticker": ticker, "type": "FM_only (P1)",
-        "SR_w scaled val": p1_val_sr, "SR_w scaled": p1_test_sr,
+        "SR_w scaled val": float(df_p1["SR_w scaled val"].iloc[0]),
+        "SR_w scaled": float(df_p1["SR_w scaled"].iloc[0]),
+        "PnL_w": float(df_p1["PnL_w"].iloc[0]),
+        "RMSE": float(df_p1["RMSE"].iloc[0]),
+        "MAE": float(df_p1["MAE"].iloc[0]),
+        "Corr": float(df_p1["Corr"].iloc[0]),
     })
 
     # ═══ Phase 2: Fine-tune output head with financial loss ═══
@@ -239,13 +256,37 @@ def train_one(gpu_id, ticker, ti):
         if best_state is None:
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-        # Test eval
+        # Full test eval with PnL (same as FinGAN Evaluation2)
         model.load_state_dict(best_state)
-        test_sr = fast_val_sr(model, test, l, mu_cond, sd_cond, mu_x, sd_x, dev)
+        model.eval()
+        gen = FlowGenAdapter(model, mu_cond, sd_cond, mu_x, sd_x, 40, 1).to(dev)
+
+        loss_tag = f"P2_{fin_name}"
+        df_eval, PnL_test, PnL_even, PnL_odd, means_gen, reals_test, _, _ = Evaluation2_gpu(
+            ticker=ticker, freq=2, gen=gen, test_data=test, val_data=val,
+            h=1, l=l, pred=1, hid_d=8, hid_g=8, z_dim=8,
+            lrg=1e-4, lrd=1e-4, n_epochs=200,
+            losstype=loss_tag, sr_val=0, device=dev,
+            plotsloc=os.path.join(loc, "Plots") + "/",
+            f_name=f"{ticker}-{loss_tag}", plot=False, nsamp=1000,
+        )
+
+        # Save PnL CSV
+        pnl_path = os.path.join(loc, "PnLs", f"{ticker}-{loss_tag}.csv")
+        pd.DataFrame(PnL_test).to_csv(pnl_path, index=False, header=False)
+
+        # Extract metrics from Evaluation2 output
+        test_sr = float(df_eval["SR_w scaled"].iloc[0]) if "SR_w scaled" in df_eval.columns else 0.0
+        test_pnl = float(df_eval["PnL_w"].iloc[0]) if "PnL_w" in df_eval.columns else 0.0
+        test_sr_val = float(df_eval["SR_w scaled val"].iloc[0]) if "SR_w scaled val" in df_eval.columns else best_val_sr
+        test_rmse = float(df_eval["RMSE"].iloc[0]) if "RMSE" in df_eval.columns else 0.0
+        test_mae = float(df_eval["MAE"].iloc[0]) if "MAE" in df_eval.columns else 0.0
+        test_corr = float(df_eval["Corr"].iloc[0]) if "Corr" in df_eval.columns else 0.0
 
         results.append({
-            "ticker": ticker, "type": f"P2_{fin_name}",
-            "SR_w scaled val": best_val_sr, "SR_w scaled": test_sr,
+            "ticker": ticker, "type": loss_tag,
+            "SR_w scaled val": test_sr_val, "SR_w scaled": test_sr,
+            "PnL_w": test_pnl, "RMSE": test_rmse, "MAE": test_mae, "Corr": test_corr,
             "trainable_params": trainable, "total_params": total,
         })
 
@@ -268,7 +309,7 @@ def worker(gpu_id, assignments, result_dict):
 if __name__ == "__main__":
     mp.set_start_method("spawn")
 
-    for d in ["TrainedModels", "Results"]:
+    for d in ["TrainedModels", "Results", "PnLs", "Plots"]:
         os.makedirs(os.path.join(loc, d), exist_ok=True)
 
     n_gpus = int(os.environ.get("SLURM_GPUS_ON_NODE", 4))
