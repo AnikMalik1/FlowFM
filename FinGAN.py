@@ -461,22 +461,22 @@ def Evaluation2(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z_dim
         #mae = torch.mean(torch.abs(fake-real))
     #print("RMSE: ", rmse)
     #print("MAE: ",mae)
-    b1 = generated1.squeeze()
+    # Move everything to CPU for post-processing (avoids GPU->numpy issues)
+    b1 = generated1.squeeze().cpu()
     mn1 = torch.mean(b1,dim=1)
-    real1 = test_data[:,-1].to(device)
+    real1 = test_data[:,-1].cpu()
     rl1 = real1.squeeze()
     rmse1 = torch.sqrt(torch.mean((mn1-rl1)**2))
     mae1 = torch.mean(torch.abs(mn1-rl1))
-    #print("RMSE: ",rmse,"MAE: ",mae)
     dt['RMSE'] = rmse1.item()
     dt['MAE'] = mae1.item()
-    ft1 = mn1.clone().detach().to(device)
+    ft1 = mn1.clone().detach()
     PnL1 = getPnL(ft1,rl1,ntest)
     #print("PnL in bp", PnL)
 
     #look at the Sharpe Ratio
     n_b1 = b1.shape[1]
-    PnL_ws1 = torch.empty(ntest, device=device)
+    PnL_ws1 = torch.empty(ntest)
     for i1 in range(ntest):
         fk1 = b1[i1,:]
         pu1 = (fk1>=0).sum()
@@ -557,21 +557,19 @@ def Evaluation2(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z_dim
         #mae = torch.mean(torch.abs(fake-real))
     #print("RMSE: ", rmse)
     #print("MAE: ",mae)
-    b1 = generated1.squeeze()
+    b1 = generated1.squeeze().cpu()
     mn1 = torch.mean(b1,dim=1)
-    real1 = val_data[:,-1].to(device)
+    real1 = val_data[:,-1].cpu()
     rl1 = real1.squeeze()
     rmse1 = torch.sqrt(torch.mean((mn1-rl1)**2))
     mae1 = torch.mean(torch.abs(mn1-rl1))
-    #print("RMSE: ",rmse,"MAE: ",mae)
     dt['RMSE val'] = rmse1.item()
     dt['MAE val'] = mae1.item()
-    ft1 = mn1.clone().detach().to(device)
-    #print("PnL in bp", PnL)
+    ft1 = mn1.clone().detach()
 
     #look at the Sharpe Ratio
     n_b1 = b1.shape[1]
-    PnL_ws1 = torch.empty(ntest, device=device)
+    PnL_ws1 = torch.empty(ntest)
     for i1 in range(ntest):
         fk1 = b1[i1,:]
         pu1 = (fk1>=0).sum()
@@ -651,22 +649,21 @@ def Evaluation3(tickers,freq,gen,test, val, h,l,pred,hid_d,hid_g, z_dim, lrg, lr
             #mae = torch.mean(torch.abs(fake-real))
         #print("RMSE: ", rmse)
         #print("MAE: ",mae)
-        b1 = generated1.squeeze()
+        b1 = generated1.squeeze().cpu()
         mn1 = torch.mean(b1,dim=1)
         # print(mn1.shape)
         means_test[ii, :] = np.array(mn1.detach().cpu())
-        real1 = test_data[:,-1].to(device)
+        real1 = test_data[:,-1].cpu()
         rl1 = real1.squeeze()
         rmse1 = torch.sqrt(torch.mean((mn1-rl1)**2))
         mae1 = torch.mean(torch.abs(mn1-rl1))
-        #print("RMSE: ",rmse,"MAE: ",mae)
         dt['RMSE'] = rmse1.item()
         dt['MAE'] = mae1.item()
-        ft1 = mn1.clone().detach().to(device)        #print("PnL in bp", PnL)
-    
+        ft1 = mn1.clone().detach()
+
         #look at the Sharpe Ratio
         n_b1 = b1.shape[1]
-        PnL_ws1 = torch.empty(ntest, device=device)
+        PnL_ws1 = torch.empty(ntest)
         for i1 in range(ntest):
             fk1 = b1[i1,:]
             pu1 = (fk1>=0).sum()
@@ -737,23 +734,21 @@ def Evaluation3(tickers,freq,gen,test, val, h,l,pred,hid_d,hid_g, z_dim, lrg, lr
             #mae = torch.mean(torch.abs(fake-real))
         #print("RMSE: ", rmse)
         #print("MAE: ",mae)
-        b1 = generated1.squeeze()
+        b1 = generated1.squeeze().cpu()
         mn1 = torch.mean(b1,dim=1)
         means_val[ii, :] = np.array(mn1.detach().cpu())
 
-        real1 = val_data[:,-1].to(device)
+        real1 = val_data[:,-1].cpu()
         rl1 = real1.squeeze()
         rmse1 = torch.sqrt(torch.mean((mn1-rl1)**2))
         mae1 = torch.mean(torch.abs(mn1-rl1))
-        #print("RMSE: ",rmse,"MAE: ",mae)
         dt['RMSE val'] = rmse1.item()
         dt['MAE val'] = mae1.item()
-        ft1 = mn1.clone().detach().to(device)
-        #print("PnL in bp", PnL)
-    
+        ft1 = mn1.clone().detach()
+
         #look at the Sharpe Ratio
         n_b1 = b1.shape[1]
-        PnL_ws1 = torch.empty(ntest, device=device)
+        PnL_ws1 = torch.empty(ntest)
         for i1 in range(ntest):
             fk1 = b1[i1,:]
             pu1 = (fk1>=0).sum()
@@ -3032,9 +3027,9 @@ def Evaluation2LSTM(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z
         #mae = torch.mean(torch.abs(fake-real))
     #print("RMSE: ", rmse)
     #print("MAE: ",mae)
-    b1 = fake1[0,:,0]
+    b1 = fake1[0,:,0].cpu()
     mn1 = b1
-    real1 = test_data[:,-1].to(device)
+    real1 = test_data[:,-1].cpu()
     rl1 = real1.squeeze()
 
     rmse1 = torch.sqrt(torch.mean((mn1-rl1)**2))
@@ -3093,7 +3088,7 @@ def Evaluation2LSTM(ticker,freq,gen,test_data, val_data, h,l,pred,hid_d,hid_g, z
     #print("MAE: ",mae)
     b1 = fake1[0,:,0]
     mn1 = b1
-    real1 = val_data[:,-1].to(device)
+    real1 = val_data[:,-1].cpu()
     rl1 = real1.squeeze()
     rmse1 = torch.sqrt(torch.mean((mn1-rl1)**2))
     mae1 = torch.mean(torch.abs(mn1-rl1))
