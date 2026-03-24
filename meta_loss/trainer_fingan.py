@@ -1,11 +1,10 @@
 """
 Trainer — train FinGAN with a given financial loss, return metrics.
-Uses original FinGAN generator/discriminator architecture.
+Uses original FinGAN Generator/Discriminator from FinGAN.py (zero rewrite).
 """
 import os
 import sys
 import time
-import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -30,56 +29,9 @@ def _load_data(ticker, tr=0.8, vl=0.1, h=1, l=10, pred=1):
     return train_np, val_np, test_np
 
 
-# ── FinGAN Generator (same as original FinGAN.py) ──────
-
-def combine_vectors(x, y, dim=2):
-    return torch.cat((x.float(), y.float()), dim=dim)
-
-class Generator(nn.Module):
-    def __init__(self, z_dim, cond_dim, hid_g, mean_val, std_val):
-        super().__init__()
-        self.hid_g = hid_g
-        self.z_dim = z_dim
-        self.mean = mean_val
-        self.std = std_val
-        self.lstm = nn.LSTM(input_size=cond_dim, hidden_size=hid_g, num_layers=1)
-        self.linear1 = nn.Linear(hid_g + z_dim, hid_g + z_dim)
-        self.linear2 = nn.Linear(hid_g + z_dim, 1)
-        self.relu = nn.ReLU()
-        nn.init.xavier_normal_(self.lstm.weight_ih_l0)
-        nn.init.xavier_normal_(self.lstm.weight_hh_l0)
-        nn.init.xavier_normal_(self.linear1.weight)
-        nn.init.xavier_normal_(self.linear2.weight)
-
-    def forward(self, noise, cond, h0, c0):
-        cond_n = (cond - self.mean) / self.std
-        _, (h_n, _) = self.lstm(cond_n, (h0, c0))
-        out = combine_vectors(noise.float(), h_n.float(), dim=-1)
-        out = self.relu(self.linear1(out))
-        out = self.linear2(out)
-        return out * self.std + self.mean
-
-class Discriminator(nn.Module):
-    def __init__(self, cond_dim, hid_d):
-        super().__init__()
-        self.lstm = nn.LSTM(input_size=cond_dim, hidden_size=hid_d, num_layers=1)
-        self.linear1 = nn.Linear(hid_d + 1, hid_d)
-        self.linear2 = nn.Linear(hid_d, 1)
-        self.relu = nn.LeakyReLU(0.2)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, noise, cond, h0, c0):
-        _, (h_n, _) = self.lstm(cond, (h0, c0))
-        out = combine_vectors(noise.float(), h_n.float(), dim=-1)
-        out = self.relu(self.linear1(out))
-        out = self.sigmoid(self.linear2(out))
-        return out
-
-
-# ── Vectorized Eval ─────────────────────────────────────
-
 @torch.no_grad()
-def _fast_val_sr_fingan(gen, data, l, z_dim, hid_g, device, nsamp=256):
+def _fast_val_sr_fingan(gen, data, l, z_dim, hid_g, device, mean_val, std_val, nsamp=256):
+    """Vectorized val SR for FinGAN generator."""
     gen.eval()
     data = data.to(device).float()
     T = data.shape[0]
@@ -103,8 +55,6 @@ def _fast_val_sr_fingan(gen, data, l, z_dim, hid_g, device, nsamp=256):
     return (mu / sd) * np.sqrt(252.0)
 
 
-# ── Training ────────────────────────────────────────────
-
 def train_single_ticker_fingan(
     ticker: str,
     financial_loss_fn,
@@ -119,9 +69,10 @@ def train_single_ticker_fingan(
     Train FinGAN on one ticker with custom financial loss terms.
 
     financial_loss_fn(gen_out, real, tanh_temp) -> scalar
-        gen_out: (N,) generated returns
-        real: (N,) actual returns
+        gen_out: (B,) generated returns (denormalized)
+        real: (B,) actual returns
         tanh_temp: float
+    Returns: dict with {ticker, model, val_sr, best_epoch, train_time_s}
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -139,11 +90,12 @@ def train_single_ticker_fingan(
     val_t = torch.from_numpy(val_np).float().to(device)
 
     N = train_t.shape[0]
-    mean_val = float(train_t[:, :l].mean().item())
-    std_val = float(train_t[:, :l].std().item()) + 1e-8
+    mean_val = float(train_t.mean().item())
+    std_val = float(train_t.std().item()) + 1e-8
 
-    gen = Generator(z_dim, l, hid_g, mean_val, std_val).to(device)
-    disc = Discriminator(1, hid_d).to(device)
+    # Use original FinGAN Generator and Discriminator classes
+    gen = FinGAN.Generator(z_dim, l + 1, hid_g, mean_val, std_val).to(device)
+    disc = FinGAN.Discriminator(l + 1, hid_d, mean_val, std_val).to(device)
     gen_opt = optim.RMSprop(gen.parameters(), lr=1e-4)
     disc_opt = optim.RMSprop(disc.parameters(), lr=1e-4)
     criterion = nn.BCELoss()
@@ -166,22 +118,26 @@ def train_single_ticker_fingan(
 
         for b in range(nbatches):
             idx = perm[b * batch_size:(b + 1) * batch_size]
-            cond_b = train_t[idx, :l].unsqueeze(0)
-            real_b = train_t[idx, -1]
+            cond_b = train_t[idx, :l].unsqueeze(0)           # (1, B, l)
+            real_b = train_t[idx, -1]                          # (B,)
+            real_disc_in = train_t[idx].unsqueeze(0)           # (1, B, l+1) for disc
 
-            # Disc step
+            # Disc step: disc takes concat(cond, real_or_fake) as input
             disc_opt.zero_grad()
             noise = torch.randn(1, batch_size, z_dim, device=device)
-            h0 = torch.zeros(1, batch_size, hid_g, device=device)
-            c0 = torch.zeros(1, batch_size, hid_g, device=device)
+            h0g = torch.zeros(1, batch_size, hid_g, device=device)
+            c0g = torch.zeros(1, batch_size, hid_g, device=device)
             h0d = torch.zeros(1, batch_size, hid_d, device=device)
             c0d = torch.zeros(1, batch_size, hid_d, device=device)
 
             with torch.no_grad():
-                fake = gen(noise, cond_b, h0, c0).squeeze()
+                fake_out = gen(noise, cond_b, h0g, c0g)  # (1, B, 1)
 
-            d_real = disc(real_b.unsqueeze(0).unsqueeze(-1), cond_b, h0d, c0d)
-            d_fake = disc(fake.unsqueeze(0).unsqueeze(-1), cond_b, h0d, c0d)
+            # Disc input = concat(cond, real) or concat(cond, fake)
+            fake_disc_in = torch.cat([cond_b, fake_out], dim=-1)  # (1, B, l+1)
+
+            d_real = disc(real_disc_in, h0d, c0d)
+            d_fake = disc(fake_disc_in, h0d.clone(), c0d.clone())
             d_loss = (criterion(d_real, torch.ones_like(d_real)) +
                       criterion(d_fake, torch.zeros_like(d_fake))) / 2
             d_loss.backward()
@@ -190,19 +146,24 @@ def train_single_ticker_fingan(
             # Gen step
             gen_opt.zero_grad()
             noise = torch.randn(1, batch_size, z_dim, device=device)
-            fake = gen(noise, cond_b, h0, c0).squeeze()
+            fake_out = gen(noise, cond_b, h0g, c0g)  # (1, B, 1)
 
-            d_fake = disc(fake.unsqueeze(0).unsqueeze(-1), cond_b, h0d, c0d)
+            fake_disc_in = torch.cat([cond_b, fake_out], dim=-1)
+            d_fake = disc(fake_disc_in, h0d.clone(), c0d.clone())
             bce_loss = criterion(d_fake, torch.ones_like(d_fake))
 
-            fin_loss = financial_loss_fn(fake, real_b, tanh_temp)
+            # Financial loss on generated returns
+            gen_returns = fake_out.squeeze()  # (B,)
+            fin_loss = financial_loss_fn(gen_returns, real_b, tanh_temp)
             g_loss = bce_loss + fin_loss
+
             g_loss.backward()
             gen_opt.step()
 
         # Eval
         if ep % eval_every == 0:
-            val_sr = _fast_val_sr_fingan(gen, val_t, l, z_dim, hid_g, device)
+            val_sr = _fast_val_sr_fingan(gen, val_t, l, z_dim, hid_g, device,
+                                          mean_val, std_val)
             if verbose:
                 print(f"  {ticker} fingan ep={ep:4d} val_SR={val_sr:.4f}")
             if val_sr > best_val_sr:
