@@ -47,7 +47,7 @@ def loss_pnl(v_pred, v_target, x1_hat, x1_real, tanh_c=1.0):
     fm = torch.mean((v_pred - v_target) ** 2)
     ft = torch.tanh(tanh_c * x1_hat.squeeze(-1))
     pnl = -torch.mean(ft * x1_real.squeeze(-1))
-    return fm + 1000.0 * pnl
+    return fm + LAMBDA * pnl
 
 def loss_sr(v_pred, v_target, x1_hat, x1_real, tanh_c=1.0):
     """Velocity MSE + Sharpe proxy."""
@@ -55,10 +55,69 @@ def loss_sr(v_pred, v_target, x1_hat, x1_real, tanh_c=1.0):
     ft = torch.tanh(tanh_c * x1_hat.squeeze(-1))
     pnl_vec = ft * x1_real.squeeze(-1)
     sr = -(torch.mean(pnl_vec) / (torch.std(pnl_vec) + 1e-8))
-    return fm + 1000.0 * sr
+    return fm + LAMBDA * sr
+
+# ── GradientCheck: auto-balance FM vs financial loss (like FinGAN) ─────
+def gradient_check_warmup(model, cond_train, x1_train, x1_real_train,
+                          loss_fn, dev, n_epochs=15, mu_x=0.0, sd_x=1.0):
+    """
+    Measure ratio of ||grad_FM|| / ||grad_fin|| over warmup epochs.
+    Returns scale such that: total_loss = fm + scale * fin_loss
+    This matches FinGAN's GradientCheck which computes median(||BCE|| / ||fin||).
+    """
+    model.train()
+    l = cond_train.shape[1]
+    N = cond_train.shape[0]
+    ratios = []
+
+    for ep in range(n_epochs):
+        perm = torch.randperm(N, device=dev)
+        c = cond_train[perm]
+        x = x1_train[perm]
+        x_real = x1_real_train[perm]
+
+        # Forward
+        B = x.shape[0]
+        t = torch.rand((B,), device=dev).clamp(1e-4, 1.0 - 1e-4)
+        x0 = torch.randn_like(x)
+        x_t = (1.0 - t)[:, None] * x0 + t[:, None] * x
+        v_target = x - x0
+        v_pred = model(x_t, c, t)
+        x1_hat = (x_t + (1.0 - t)[:, None] * v_pred) * sd_x + mu_x
+
+        # FM loss gradient norm
+        fm_loss = torch.mean((v_pred - v_target) ** 2)
+        model.zero_grad()
+        fm_loss.backward(retain_graph=True)
+        fm_norm = torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None]).norm().item()
+
+        # Financial loss gradient norm (loss_fn minus FM component)
+        # Compute full loss, subtract FM to get only the financial part
+        full_loss = loss_fn(v_pred.detach().requires_grad_(True), v_target.detach(),
+                           x1_hat.detach().requires_grad_(True), x_real, 1.0)
+        # Simpler: compute financial terms directly
+        ft = torch.tanh(1.0 * x1_hat.squeeze(-1))
+        r = x_real.squeeze(-1)
+        pnl_vec = ft * r
+        fin_loss = -torch.mean(pnl_vec)  # basic PnL as proxy for all financial terms
+
+        model.zero_grad()
+        fin_loss.backward()
+        fin_norm = torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None]).norm().item()
+
+        if fin_norm > 1e-12:
+            ratios.append(fm_norm / fin_norm)
+
+    model.zero_grad()
+    if ratios:
+        scale = float(np.median(ratios))
+        return max(0.01, min(100.0, scale))  # clamp to reasonable range
+    return 1.0
+
 
 # All compound losses: exactly 1 FM base + additive auxiliary terms (no double-counting)
-LAMBDA = 1000.0
+# LAMBDA is now per-ticker, computed by gradient_check_warmup
+LAMBDA = 1.0  # default, overridden by gradient check
 
 def _aux_terms(x1_hat, x1_real, tanh_c):
     """Shared computation for PnL/SR/MSE/STD auxiliary terms."""
@@ -175,10 +234,21 @@ def train_one(gpu_id, ticker, ti):
     t0_ticker = time.time()
 
     for loss_name, loss_fn in LOSS_FUNCTIONS.items():
+        global LAMBDA
         torch.manual_seed(1000 + ti)
         np.random.seed(1000 + ti)
 
         model = make_model(l, hidden, depth, dropout, dev)
+
+        # GradientCheck: auto-balance FM vs financial loss (like FinGAN)
+        if loss_name != "FM_only":
+            scale = gradient_check_warmup(
+                model, cond_train, x1_train, x1_real_train,
+                loss_fn, dev, n_epochs=15, mu_x=mu_x, sd_x=sd_x)
+            LAMBDA = scale
+        else:
+            LAMBDA = 0.0  # pure FM, no financial loss
+
         opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01, betas=(0.9, 0.95))
         ema = EMA(model, decay=ema_decay)
 
@@ -254,13 +324,15 @@ def train_one(gpu_id, ticker, ti):
             "ticker": ticker, "type": loss_name,
             "SR_w scaled val": best_val_sr,
             "SR_w scaled": test_sr,
+            "grad_scale": LAMBDA,
         })
 
     elapsed = time.time() - t0_ticker
     best = max(results, key=lambda r: r["SR_w scaled val"])
     print(f"[GPU{gpu_id}] {ticker} done {elapsed:.0f}s | "
           f"best={best['type']} val_SR={best['SR_w scaled val']:+.3f} "
-          f"test_SR={best['SR_w scaled']:+.3f}", flush=True)
+          f"test_SR={best['SR_w scaled']:+.3f} "
+          f"scale={best.get('grad_scale', 'N/A')}", flush=True)
 
     return results
 
