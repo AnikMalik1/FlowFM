@@ -1,0 +1,18 @@
+#!/bin/bash
+#SBATCH --account=brics.s5e
+#SBATCH --partition=workq
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:4
+#SBATCH --time=01:00:00
+#SBATCH --output=/projects/s5e/quant/fingan/logs/fingan_fast_%j.out
+#SBATCH --error=/projects/s5e/quant/fingan/logs/fingan_fast_%j.err
+
+mkdir -p /projects/s5e/quant/fingan/logs
+
+srun --ntasks-per-node=1 bash -c '
+  source /etc/profile.d/modules.sh 2>/dev/null || true
+  module load cuda/12.6 2>/dev/null || true
+  export PATH="/projects/s5e/quant/miniforge3/bin:$PATH"
+  cd /projects/s5e/quant/fingan/FlowFM_repo
+  python3 run_fingan_fast.py
+'
