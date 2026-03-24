@@ -16,7 +16,7 @@ set -euo pipefail
 # base env packages are at miniforge3/lib/python3.12/site-packages/
 export PATH="/projects/s5e/quant/miniforge3/bin:$PATH"
 export CONDA_PREFIX="/projects/s5e/quant/miniforge3"
-export LD_LIBRARY_PATH="/projects/s5e/quant/miniforge3/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="/projects/s5e/quant/miniforge3/lib:/projects/s5e/quant/miniforge3/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
 echo "[$(date)] Python: $(python3 --version) at $(which python3)"
 
 # ── Antigravity Manager (LLM API proxy) ────────────────
