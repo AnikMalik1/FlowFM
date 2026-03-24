@@ -164,6 +164,7 @@ def train_single_ticker_fingan(
     max_time_s: float = 300.0,
     device=None,
     verbose: bool = True,
+    seed: int = 42,
 ) -> dict:
     """
     Train FinGAN on one ticker with custom financial loss terms.
@@ -177,8 +178,8 @@ def train_single_ticker_fingan(
     z_dim, hid_g, hid_d = 8, 8, 8
     tanh_temp = 100.0
 
-    torch.manual_seed(42)
-    np.random.seed(42)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
     train_np, val_np, _ = _load_data(ticker, l=l)
     train_t = torch.from_numpy(train_np).float().to(device)

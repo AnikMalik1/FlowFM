@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-SE-Agent Style Loss Evolution for FinGAN.
+SE-Agent Style Loss Evolution for FinGAN — v2.
 
 Based on: "SE-Agent: Self-Evolution Trajectory Optimization" (NeurIPS 2025)
 Three operations: Revision, Recombination, Refinement.
 
-Unlike GA (fixed primitives + weight optimization), this operates on
-FULL LOSS FUNCTION CODE via LLM semantic operations.
+v2 improvements (inspired by Goldie et al. RLC 2025):
+1. JSON structured output with "thought" field (forced reasoning)
+2. Baseline-normalized SR reporting
+3. Multi-seed evaluation for robustness
 """
-import argparse, os, sys, json, time, copy
+import argparse, os, sys, json, time, copy, re
 from datetime import datetime
 import torch, numpy as np
 
@@ -17,7 +19,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 from loss_registry import LossRegistry
 from trainer_fingan import train_single_ticker_fingan
-from evaluator_dual import _adapt_ga_genome_to_financial_loss
 
 
 # ── LLM Client ──────────────────────────────────────────
@@ -25,11 +26,21 @@ from evaluator_dual import _adapt_ga_genome_to_financial_loss
 def _llm_call(system: str, user: str, max_tokens: int = 3000) -> str:
     from openai import OpenAI
     client = OpenAI(base_url=config.LLM_BASE_URL, api_key=config.LLM_API_KEY)
-    r = client.chat.completions.create(
+    kwargs = dict(
         model=config.LLM_MODEL, max_tokens=max_tokens,
         messages=[{"role": "system", "content": system},
                   {"role": "user", "content": user}],
     )
+    # Try JSON mode
+    try:
+        kwargs["response_format"] = {"type": "json_object"}
+        r = client.chat.completions.create(**kwargs)
+        return r.choices[0].message.content
+    except Exception:
+        pass
+
+    kwargs.pop("response_format", None)
+    r = client.chat.completions.create(**kwargs)
     return r.choices[0].message.content
 
 
@@ -43,6 +54,61 @@ def _extract_code(text: str) -> str:
         e = text.index("```", s)
         return text[s:e].strip()
     return text
+
+
+def _parse_response(text: str) -> dict:
+    """Parse LLM response: try JSON first, fallback to regex."""
+    # 1. Direct JSON
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and "code" in data:
+            data.setdefault("name", "unnamed")
+            data.setdefault("thought", "")
+            return data
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # 2. JSON in markdown block
+    for pattern in [r'```json\s*([\s\S]*?)```', r'```\s*(\{[\s\S]*?\})\s*```']:
+        m = re.search(pattern, text)
+        if m:
+            try:
+                data = json.loads(m.group(1))
+                if isinstance(data, dict) and "code" in data:
+                    data.setdefault("name", "unnamed")
+                    data.setdefault("thought", "")
+                    return data
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+    # 3. Brace-matching for embedded JSON
+    brace_depth = 0
+    json_start = None
+    for i, ch in enumerate(text):
+        if ch == '{':
+            if brace_depth == 0:
+                json_start = i
+            brace_depth += 1
+        elif ch == '}':
+            brace_depth -= 1
+            if brace_depth == 0 and json_start is not None:
+                candidate = text[json_start:i+1]
+                if '"code"' in candidate:
+                    try:
+                        data = json.loads(candidate)
+                        if isinstance(data, dict) and "code" in data:
+                            data.setdefault("name", "unnamed")
+                            data.setdefault("thought", "")
+                            return data
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                json_start = None
+
+    # 4. Fallback: regex extraction
+    code = _extract_code(text)
+    m = re.search(r'[Nn]ame[:\s]+[`"]*(\w+)[`"]*', text)
+    name = m.group(1) if m else "unnamed"
+    return {"thought": text[:300], "name": name, "code": code}
 
 
 LOSS_SYSTEM = """You design loss functions for FinGAN (GAN for probabilistic return forecasting).
@@ -61,37 +127,40 @@ def loss_fn(gen_out, real, tanh_temp):
 ```
 
 Known effective terms:
-- PnL: -mean(tanh(T*gen_out) * real)  — maximize trading profit
-- MSE: mean((gen_out - real)^2)  — prediction accuracy
-- Sharpe: -mean(pnl) / std(pnl)  — risk-adjusted return
-- STD: std(tanh(T*gen_out) * real)  — PnL volatility
-- Sortino: -mean(pnl) / sqrt(mean(relu(-pnl)^2))  — downside risk
-- Winrate: mean(relu(margin - gen_out*real))  — directional accuracy hinge
+- PnL: -mean(tanh(T*gen_out) * real)  -- maximize trading profit
+- MSE: mean((gen_out - real)^2)  -- prediction accuracy
+- Sharpe: -mean(pnl) / std(pnl)  -- risk-adjusted return
+- STD: std(tanh(T*gen_out) * real)  -- PnL volatility
+- Sortino: -mean(pnl) / sqrt(mean(relu(-pnl)^2))  -- downside risk
+- Winrate: mean(relu(margin - gen_out*real))  -- directional accuracy hinge
 
 Rules:
 1. Return scalar Tensor, must be differentiable
 2. Can use torch.*, math.*
 3. Function name MUST be loss_fn
 4. Can combine existing terms OR invent new ones
-5. Can use curriculum scheduling via epoch (not available here, ignore)
+
+When you respond, output a JSON object with exactly three keys:
+1. "thought": Your analysis and reasoning (2-4 sentences). Be specific about mechanisms.
+2. "name": snake_case name for the loss function
+3. "code": The exact Python code defining loss_fn (as a single string, use \\n for newlines)
 """
 
 
 # ── Evaluation ───────────────────────────────────────────
 
-def evaluate_loss(code: str, name: str, registry: LossRegistry, device) -> dict:
-    """Load loss_fn from code, validate with FinGAN interface, evaluate on 3 tickers."""
+def evaluate_loss(code: str, name: str, registry: LossRegistry, device,
+                  n_seeds: int = 3, baseline_sr: float = 1.0) -> dict:
+    """Load loss_fn from code, validate, evaluate on 3 tickers x n_seeds seeds."""
     from loss_registry import _scan_code_safety, _sanitize_name
     import importlib.util
 
     name = _sanitize_name(name)
 
-    # Safety scan
     err = _scan_code_safety(code)
     if err:
-        return {"name": name, "sr": -999, "error": f"safety: {err}", "code": code}
+        return {"name": name, "sr": -999, "norm_sr": -999, "error": f"safety: {err}", "code": code}
 
-    # Write and load
     path = os.path.join(config.LOSSES_DIR, f"{name}.py")
     with open(path, "w") as f:
         f.write(code)
@@ -101,38 +170,46 @@ def evaluate_loss(code: str, name: str, registry: LossRegistry, device) -> dict:
         spec.loader.exec_module(mod)
         fn = mod.loss_fn
     except Exception as e:
-        return {"name": name, "sr": -999, "error": f"load: {e}", "code": code}
+        return {"name": name, "sr": -999, "norm_sr": -999, "error": f"load: {e}", "code": code}
 
-    # Validate with FinGAN interface (gen_out, real, tanh_temp)
+    # Validate
     try:
         test_out = torch.randn(32, requires_grad=True)
         test_real = torch.randn(32)
         loss = fn(test_out, test_real, 100.0)
         if not isinstance(loss, torch.Tensor) or loss.dim() != 0:
-            return {"name": name, "sr": -999, "error": f"bad output: {type(loss)}", "code": code}
+            return {"name": name, "sr": -999, "norm_sr": -999, "error": f"bad output: {type(loss)}", "code": code}
         loss.backward()
     except Exception as e:
-        return {"name": name, "sr": -999, "error": f"validate: {e}", "code": code}
+        return {"name": name, "sr": -999, "norm_sr": -999, "error": f"validate: {e}", "code": code}
 
-    # Evaluate on FinGAN (3 tickers) -- fn IS the financial_loss_fn directly
+    # Evaluate on FinGAN: 3 tickers x n_seeds seeds
+    seeds = list(range(42, 42 + n_seeds))
     results = {}
     for ticker in config.STAGE1_TICKERS:
-        try:
-            r = train_single_ticker_fingan(
-                ticker=ticker, financial_loss_fn=fn,
-                max_epochs=100, warmup_epochs=15,
-                eval_every=20, patience=6,
-                device=device, verbose=False)
-            results[ticker] = r["val_sr"]
-        except Exception as e:
-            results[ticker] = -999
-            print(f"    {ticker} FAILED: {e}")
+        sr_per_seed = []
+        for seed in seeds:
+            try:
+                r = train_single_ticker_fingan(
+                    ticker=ticker, financial_loss_fn=fn,
+                    max_epochs=100, warmup_epochs=15,
+                    eval_every=20, patience=6,
+                    device=device, verbose=False, seed=seed)
+                sr_per_seed.append(r["val_sr"])
+            except Exception as e:
+                sr_per_seed.append(-999)
+                print(f"    {ticker} seed={seed} FAILED: {e}")
+        valid_sr = [s for s in sr_per_seed if s > -900]
+        results[ticker] = float(np.mean(valid_sr)) if valid_sr else -999
 
     mean_sr = float(np.mean([v for v in results.values() if v > -900]))
     if not any(v > -900 for v in results.values()):
         mean_sr = -999
 
-    return {"name": name, "sr": mean_sr, "per_ticker": results, "code": code}
+    norm_sr = mean_sr / baseline_sr if baseline_sr > 0 and mean_sr > -900 else -999
+
+    return {"name": name, "sr": mean_sr, "norm_sr": norm_sr,
+            "per_ticker": results, "code": code}
 
 
 # ── Operation 1: Revision (Multi-Planning + Reflection) ─
@@ -149,51 +226,52 @@ def generate_initial_population(n: int = 5) -> list[dict]:
     """Multi-Planning: generate diverse loss functions using different strategies."""
     population = []
     for i, strategy in enumerate(PLANNING_STRATEGIES[:n]):
-        prompt = f"""Generate a novel loss function for FinGAN.
-
-Strategy: {strategy}
-
-Output ONLY the Python code block with loss_fn(gen_out, real, tanh_temp)."""
+        prompt = (
+            f"Generate a novel loss function for FinGAN.\n\n"
+            f"Strategy: {strategy}\n\n"
+            f"Respond with JSON: "
+            f'{{"thought": "...", "name": "...", "code": "..."}}'
+        )
 
         text = _llm_call(LOSS_SYSTEM, prompt)
-        code = _extract_code(text)
+        parsed = _parse_response(text)
         population.append({
             "name": f"plan_{i}",
-            "code": code,
+            "code": parsed["code"],
             "strategy": strategy,
-            "reasoning": text[:300],
+            "thought": parsed.get("thought", ""),
+            "reasoning": parsed.get("thought", text[:300]),
         })
         print(f"  Generated plan_{i}: {strategy[:60]}")
+        if parsed.get("thought"):
+            print(f"    Thought: {parsed['thought'][:150]}...")
     return population
 
 
-def reflect_and_revise(candidate: dict, eval_result: dict) -> dict:
+def reflect_and_revise(candidate: dict, eval_result: dict, baseline_sr: float) -> dict:
     """Reflection: analyze why a loss worked/failed, then revise."""
-    prompt = f"""Analyze this loss function and its results, then create an improved version.
-
-## Original Loss
-```python
-{candidate['code']}
-```
-
-## Results
-Mean Sharpe Ratio: {eval_result['sr']:.4f}
-Per-ticker: {json.dumps(eval_result.get('per_ticker', {}), indent=2)}
-
-## Task
-1. Identify what works and what doesn't in this loss
-2. Propose specific improvements
-3. Output a REVISED loss function that addresses the weaknesses
-
-Output reasoning (2-3 sentences) then the Python code block."""
+    norm = eval_result['sr'] / baseline_sr if baseline_sr > 0 else 0
+    prompt = (
+        f"Analyze this loss function and its results, then create an improved version.\n\n"
+        f"## Original Loss\n```python\n{candidate['code']}\n```\n\n"
+        f"## Results\n"
+        f"Mean Sharpe Ratio: {eval_result['sr']:.4f} (normalized: {norm:.3f})\n"
+        f"Per-ticker: {json.dumps(eval_result.get('per_ticker', {}), indent=2)}\n\n"
+        f"## Task\n"
+        f"1. Identify what works and what doesn't in this loss\n"
+        f"2. Propose specific improvements\n"
+        f"3. Output a REVISED loss function that addresses the weaknesses\n\n"
+        f'Respond with JSON: {{"thought": "...", "name": "...", "code": "..."}}'
+    )
 
     text = _llm_call(LOSS_SYSTEM, prompt)
-    code = _extract_code(text)
+    parsed = _parse_response(text)
     return {
         "name": f"{candidate['name']}_rev",
-        "code": code,
+        "code": parsed["code"],
         "parent": candidate["name"],
-        "reasoning": text[:300],
+        "thought": parsed.get("thought", ""),
+        "reasoning": parsed.get("thought", text[:300]),
     }
 
 
@@ -201,94 +279,84 @@ Output reasoning (2-3 sentences) then the Python code block."""
 
 def crossover(cand_a: dict, cand_b: dict) -> dict:
     """Combine best elements from two loss functions."""
-    prompt = f"""Combine the best elements from these two loss functions into a new, superior one.
-
-## Loss A (SR={cand_a.get('sr', '?')})
-```python
-{cand_a['code']}
-```
-
-## Loss B (SR={cand_b.get('sr', '?')})
-```python
-{cand_b['code']}
-```
-
-## Task
-1. Identify strengths of each loss
-2. Create a NEW loss that combines the best parts
-3. Don't just concatenate — create genuine synthesis
-
-Output reasoning then Python code block."""
+    prompt = (
+        f"Combine the best elements from these two loss functions into a new, superior one.\n\n"
+        f"## Loss A (SR={cand_a.get('sr', '?')}, norm={cand_a.get('norm_sr', '?')})\n"
+        f"```python\n{cand_a['code']}\n```\n\n"
+        f"## Loss B (SR={cand_b.get('sr', '?')}, norm={cand_b.get('norm_sr', '?')})\n"
+        f"```python\n{cand_b['code']}\n```\n\n"
+        f"## Task\n"
+        f"1. Identify strengths of each loss\n"
+        f"2. Create a NEW loss that combines the best parts\n"
+        f"3. Don't just concatenate -- create genuine synthesis\n\n"
+        f'Respond with JSON: {{"thought": "...", "name": "...", "code": "..."}}'
+    )
 
     text = _llm_call(LOSS_SYSTEM, prompt)
-    code = _extract_code(text)
+    parsed = _parse_response(text)
     return {
         "name": f"cross_{cand_a['name']}_{cand_b['name']}",
-        "code": code,
+        "code": parsed["code"],
         "parents": [cand_a["name"], cand_b["name"]],
-        "reasoning": text[:300],
+        "thought": parsed.get("thought", ""),
+        "reasoning": parsed.get("thought", text[:300]),
     }
 
 
 def transfer(target: dict, references: list[dict]) -> dict:
     """Transfer winning patterns from reference losses to enhance target."""
     ref_texts = "\n\n".join(
-        f"### {r['name']} (SR={r.get('sr', '?')})\n```python\n{r['code']}\n```"
+        f"### {r['name']} (SR={r.get('sr', '?')}, norm={r.get('norm_sr', '?')})\n```python\n{r['code']}\n```"
         for r in references[:3]
     )
 
-    prompt = f"""Enhance this target loss by transferring effective patterns from the reference losses.
-
-## Target Loss (SR={target.get('sr', '?')})
-```python
-{target['code']}
-```
-
-## Reference Losses (successful)
-{ref_texts}
-
-## Task
-1. Identify what makes the references successful
-2. Transfer those patterns to improve the target
-3. Keep what works in the target, add what's missing
-
-Output reasoning then Python code block."""
+    prompt = (
+        f"Enhance this target loss by transferring effective patterns from the reference losses.\n\n"
+        f"## Target Loss (SR={target.get('sr', '?')}, norm={target.get('norm_sr', '?')})\n"
+        f"```python\n{target['code']}\n```\n\n"
+        f"## Reference Losses (successful)\n{ref_texts}\n\n"
+        f"## Task\n"
+        f"1. Identify what makes the references successful\n"
+        f"2. Transfer those patterns to improve the target\n"
+        f"3. Keep what works in the target, add what's missing\n\n"
+        f'Respond with JSON: {{"thought": "...", "name": "...", "code": "..."}}'
+    )
 
     text = _llm_call(LOSS_SYSTEM, prompt)
-    code = _extract_code(text)
+    parsed = _parse_response(text)
     return {
         "name": f"transfer_{target['name']}",
-        "code": code,
-        "reasoning": text[:300],
+        "code": parsed["code"],
+        "thought": parsed.get("thought", ""),
+        "reasoning": parsed.get("thought", text[:300]),
     }
 
 
 def restructure(pool: list[dict]) -> dict:
     """Global restructuring: synthesize from entire pool."""
     pool_text = "\n\n".join(
-        f"### {c['name']} (SR={c.get('sr', '?')})\n```python\n{c['code']}\n```"
+        f"### {c['name']} (SR={c.get('sr', '?')}, norm={c.get('norm_sr', '?')})\n```python\n{c['code']}\n```"
         for c in sorted(pool, key=lambda x: -x.get("sr", -999))[:5]
     )
 
-    prompt = f"""Synthesize a new loss function from global analysis of this pool.
-
-## Loss Function Pool (top 5)
-{pool_text}
-
-## Task
-1. Find abstract patterns across ALL successful losses
-2. Identify what the best losses share
-3. Create a NEW loss that captures these patterns in a novel way
-4. Don't copy any single loss — synthesize
-
-Output reasoning then Python code block."""
+    prompt = (
+        f"Synthesize a new loss function from global analysis of this pool.\n\n"
+        f"## Loss Function Pool (top 5)\n{pool_text}\n\n"
+        f"## Task\n"
+        f"1. Find abstract patterns across ALL successful losses\n"
+        f"2. Identify what the best losses share\n"
+        f"3. Create a NEW loss that captures these patterns in a novel way\n"
+        f"4. Don't copy any single loss -- synthesize\n\n"
+        f'Respond with JSON: {{"thought": "...", "name": "...", "code": "..."}}'
+    )
 
     text = _llm_call(LOSS_SYSTEM, prompt)
-    code = _extract_code(text)
+    parsed = _parse_response(text)
     return {
         "name": f"restructure_{len(pool)}",
-        "code": code,
-        "reasoning": text[:300],
+        "code": parsed["code"],
+        "thought": parsed.get("thought", ""),
+        "reasoning": parsed.get("thought", text[:300]),
     }
 
 
@@ -300,7 +368,6 @@ def select_elite(pool: list[dict], k: int = 5) -> list[dict]:
     elite = []
     seen_codes = set()
     for c in sorted_pool:
-        # Simple diversity: skip near-duplicate code
         code_hash = hash(c["code"][:200])
         if code_hash in seen_codes:
             continue
@@ -316,17 +383,54 @@ def select_elite(pool: list[dict], k: int = 5) -> list[dict]:
 def run_se_agent(
     n_cycles: int = 3,
     n_initial: int = 5,
+    n_seeds: int = 3,
     device=None,
-    results_dir: str = "results/se_agent",
+    results_dir: str = "results/se_agent_v2",
     verbose: bool = True,
 ):
     os.makedirs(results_dir, exist_ok=True)
     registry = LossRegistry()
     all_results = []
+    baseline_sr = 1.0  # will be set from baselines if available
+
+    # ── Phase 0: Evaluate velocity_only baseline ─────────
+    print(f"\n{'='*60}")
+    print(f"  SE-Agent v2: Evaluating velocity_only baseline for normalization")
+    print(f"{'='*60}")
+    from losses.fingan_baselines import FINGAN_BASELINES
+    if "velocity_only" in FINGAN_BASELINES:
+        bfn = FINGAN_BASELINES["velocity_only"]
+        def make_fingan_fn(base_fn):
+            def fingan_fn(gen_out, real, tanh_temp):
+                x_pred = gen_out.unsqueeze(-1) if gen_out.dim() == 1 else gen_out
+                x_real = real.unsqueeze(-1) if real.dim() == 1 else real
+                v_dummy = torch.zeros_like(x_pred)
+                cond_dummy = torch.zeros(x_pred.shape[0], 10, device=x_pred.device)
+                return base_fn(v_dummy, v_dummy, x_pred, x_real, cond_dummy, epoch=100)
+            return fingan_fn
+
+        fingan_fn = make_fingan_fn(bfn)
+        seeds = list(range(42, 42 + n_seeds))
+        per_ticker = {}
+        for ticker in config.STAGE1_TICKERS:
+            sr_per_seed = []
+            for seed in seeds:
+                r = train_single_ticker_fingan(
+                    ticker=ticker, financial_loss_fn=fingan_fn,
+                    max_epochs=100, warmup_epochs=15,
+                    eval_every=20, patience=6,
+                    device=device, verbose=(seed == 42), seed=seed)
+                sr_per_seed.append(r["val_sr"])
+            per_ticker[ticker] = float(np.mean(sr_per_seed))
+
+        baseline_sr = float(np.mean(list(per_ticker.values())))
+        if baseline_sr <= 0:
+            baseline_sr = 1.0
+        print(f"  velocity_only baseline SR: {baseline_sr:.4f} (this is norm=1.000)")
 
     # ── Phase 1: Generate diverse initial population ─────
     print(f"\n{'='*60}")
-    print(f"  SE-Agent: Generating {n_initial} diverse loss functions")
+    print(f"  SE-Agent v2: Generating {n_initial} diverse loss functions")
     print(f"{'='*60}")
 
     population = generate_initial_population(n_initial)
@@ -335,16 +439,22 @@ def run_se_agent(
     print(f"\n--- Evaluating initial population ---")
     for i, cand in enumerate(population):
         print(f"\n[{i+1}/{len(population)}] {cand['name']}")
-        result = evaluate_loss(cand["code"], cand["name"], registry, device)
+        result = evaluate_loss(cand["code"], cand["name"], registry, device,
+                               n_seeds=n_seeds, baseline_sr=baseline_sr)
         cand["sr"] = result["sr"]
+        cand["norm_sr"] = result.get("norm_sr", -999)
         cand["per_ticker"] = result.get("per_ticker", {})
         all_results.append(result)
-        print(f"  SR = {result['sr']:.4f}")
+        print(f"  SR = {result['sr']:.4f} (norm={result.get('norm_sr', -999):.3f})")
+        if cand.get("thought"):
+            print(f"  Thought: {cand['thought'][:150]}...")
 
     for cycle in range(1, n_cycles + 1):
         print(f"\n{'#'*60}")
         print(f"  SE-Agent CYCLE {cycle}/{n_cycles}")
-        print(f"  Pool size: {len(population)}, Best SR: {max(c.get('sr',-999) for c in population):.4f}")
+        best_sr = max(c.get('sr', -999) for c in population)
+        best_norm = best_sr / baseline_sr if baseline_sr > 0 else 0
+        print(f"  Pool size: {len(population)}, Best SR: {best_sr:.4f} (norm={best_norm:.3f})")
         print(f"{'#'*60}")
 
         new_candidates = []
@@ -356,26 +466,25 @@ def run_se_agent(
                 continue
             result = next((r for r in all_results if r["name"] == cand["name"]), None)
             if result:
-                revised = reflect_and_revise(cand, result)
+                revised = reflect_and_revise(cand, result, baseline_sr)
                 new_candidates.append(revised)
                 print(f"  Revised {cand['name']} -> {revised['name']}")
+                if revised.get("thought"):
+                    print(f"    Thought: {revised['thought'][:150]}...")
 
         # ── Recombination: crossover top pairs ───────────
         print(f"\n--- Recombination ---")
         elite = select_elite(population, k=4)
         if len(elite) >= 2:
-            # Crossover top-1 × top-2
             crossed = crossover(elite[0], elite[1])
             new_candidates.append(crossed)
-            print(f"  Crossover: {elite[0]['name']} × {elite[1]['name']} -> {crossed['name']}")
+            print(f"  Crossover: {elite[0]['name']} x {elite[1]['name']} -> {crossed['name']}")
 
-            # Transfer: top references -> weakest elite
             if len(elite) >= 3:
                 transferred = transfer(elite[-1], elite[:2])
                 new_candidates.append(transferred)
-                print(f"  Transfer: {elite[:2]} -> {transferred['name']}")
+                print(f"  Transfer: top-2 -> {transferred['name']}")
 
-            # Restructure from entire pool
             restructured = restructure(population)
             new_candidates.append(restructured)
             print(f"  Restructure: pool -> {restructured['name']}")
@@ -386,11 +495,13 @@ def run_se_agent(
             name = f"c{cycle}_{cand['name']}"
             cand["name"] = name
             print(f"\n[{i+1}/{len(new_candidates)}] {name}")
-            result = evaluate_loss(cand["code"], name, registry, device)
+            result = evaluate_loss(cand["code"], name, registry, device,
+                                   n_seeds=n_seeds, baseline_sr=baseline_sr)
             cand["sr"] = result["sr"]
+            cand["norm_sr"] = result.get("norm_sr", -999)
             cand["per_ticker"] = result.get("per_ticker", {})
             all_results.append(result)
-            print(f"  SR = {result['sr']:.4f}")
+            print(f"  SR = {result['sr']:.4f} (norm={result.get('norm_sr', -999):.3f})")
 
         # ── Refinement: select top-K for next cycle ──────
         population.extend(new_candidates)
@@ -399,32 +510,42 @@ def run_se_agent(
         # Leaderboard
         print(f"\n--- Cycle {cycle} Leaderboard ---")
         for i, c in enumerate(population[:10]):
-            print(f"  {i+1}. SR={c.get('sr',-999):.4f} | {c['name']}")
+            norm = c.get('sr', -999) / baseline_sr if baseline_sr > 0 else 0
+            print(f"  {i+1}. SR={c.get('sr',-999):.4f} (norm={norm:.3f}) | {c['name']}")
 
         # Save cycle results
         cycle_path = os.path.join(results_dir, f"cycle_{cycle}.json")
         with open(cycle_path, "w") as f:
             json.dump({
                 "cycle": cycle,
-                "population": [{"name": c["name"], "sr": c.get("sr"), "code": c["code"]} for c in population],
-                "new_candidates": [{"name": c["name"], "sr": c.get("sr")} for c in new_candidates],
+                "baseline_sr": baseline_sr,
+                "population": [{"name": c["name"], "sr": c.get("sr"),
+                                "norm_sr": c.get("norm_sr"), "code": c["code"]}
+                               for c in population],
+                "new_candidates": [{"name": c["name"], "sr": c.get("sr"),
+                                    "norm_sr": c.get("norm_sr")} for c in new_candidates],
             }, f, indent=2, default=str)
 
     # Final
     best = max(population, key=lambda x: x.get("sr", -999))
+    best_norm = best.get("sr", 0) / baseline_sr if baseline_sr > 0 else 0
     print(f"\n{'='*60}")
-    print(f"  SE-Agent COMPLETE")
-    print(f"  Best: {best['name']} SR={best.get('sr',-999):.4f}")
+    print(f"  SE-Agent v2 COMPLETE")
+    print(f"  Best: {best['name']} SR={best.get('sr',-999):.4f} (norm={best_norm:.3f})")
     print(f"  Total evaluations: {len(all_results)}")
     print(f"{'='*60}")
     print(f"\nBest loss code:\n{best['code']}")
 
-    final_path = os.path.join(results_dir, "se_agent_final.json")
+    final_path = os.path.join(results_dir, "se_agent_v2_final.json")
     with open(final_path, "w") as f:
         json.dump({
-            "best": {"name": best["name"], "sr": best.get("sr"), "code": best["code"]},
-            "all_results": [{"name": r["name"], "sr": r["sr"]} for r in all_results],
-            "leaderboard": [{"name": c["name"], "sr": c.get("sr")} for c in population],
+            "baseline_sr": baseline_sr,
+            "best": {"name": best["name"], "sr": best.get("sr"),
+                     "norm_sr": best_norm, "code": best["code"]},
+            "all_results": [{"name": r["name"], "sr": r["sr"],
+                             "norm_sr": r.get("norm_sr")} for r in all_results],
+            "leaderboard": [{"name": c["name"], "sr": c.get("sr"),
+                             "norm_sr": c.get("norm_sr")} for c in population],
         }, f, indent=2, default=str)
 
     return all_results
@@ -434,6 +555,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--initial", type=int, default=5)
+    parser.add_argument("--n_seeds", type=int, default=3)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -442,4 +564,5 @@ if __name__ == "__main__":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    run_se_agent(n_cycles=args.cycles, n_initial=args.initial, device=device)
+    run_se_agent(n_cycles=args.cycles, n_initial=args.initial,
+                 n_seeds=args.n_seeds, device=device)

@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-LLM-Proposal Evolution with Reflection — FinGAN model.
+LLM-Proposal Evolution with Conversation History v2 — FinGAN model.
 
-Each round:
-1. Reflect on best + worst loss (why it worked/failed)
-2. Propose new loss based on reflection
-3. Evaluate on FinGAN
-4. Update history
-
-This is proper meta-learning: propose -> evaluate -> REFLECT -> propose better.
+Improvements over v1 (inspired by Goldie et al. RLC 2025):
+1. Cumulative conversation history (LLM sees ALL prior rounds)
+2. JSON structured output with "thought" field (forced reasoning)
+3. Baseline-normalized SR reporting
+4. Multi-seed evaluation for robustness
 """
-import argparse, os, sys, json, time
+import argparse, os, sys, json, time, re
 import torch, numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
-from loss_registry import LossRegistry, _scan_code_safety, _sanitize_name
+from loss_registry import _scan_code_safety, _sanitize_name
 from trainer_fingan import train_single_ticker_fingan
 import importlib.util
 
 
-LOSS_SYSTEM = """You design loss functions for FinGAN (GAN for probabilistic return forecasting).
+# ── System Prompt (v2: JSON output + thought field) ──────
+
+LOSS_SYSTEM_V2 = """You design loss functions for FinGAN (GAN for probabilistic return forecasting).
 
 Generator: LSTM + Linear, outputs predicted return (scalar).
 Discriminator: LSTM + Linear + Sigmoid.
@@ -36,24 +36,61 @@ def loss_fn(gen_out, real, tanh_temp):
     # Returns: scalar Tensor (added to BCE with gradient-balanced weight)
 ```
 
+Known effective terms:
+- PnL: -mean(tanh(T*gen_out) * real)  -- maximize trading profit
+- MSE: mean((gen_out - real)^2)  -- prediction accuracy
+- Sharpe: -mean(pnl) / std(pnl)  -- risk-adjusted return
+- Sortino: -mean(pnl) / sqrt(mean(relu(-pnl)^2))  -- downside risk
+- Winrate: mean(relu(margin - gen_out*real))  -- directional accuracy hinge
+
 Rules:
 1. Return scalar Tensor, differentiable
 2. Can use torch.*, math.*
 3. Function name MUST be loss_fn
-"""
+4. Can combine existing terms OR invent new ones
+
+When you respond, output a JSON object with exactly three keys:
+1. "thought": Your analysis of previous results and reasoning for the new design (2-4 sentences). Be specific about which mechanisms worked/failed and why.
+2. "name": snake_case name for the loss function
+3. "code": The exact Python code defining loss_fn (as a single string, use \\n for newlines)
+
+You are deeply familiar with financial loss design from the quantitative finance literature. Be creative and reference prior literature when possible. The user will return evaluation results after each proposal. Your goal is to maximize the Sharpe Ratio."""
 
 
-def _llm_call(system, user, max_tokens=2000):
+# ── LLM Client (v2: conversation mode + JSON attempt) ────
+
+def _llm_call_conversation(messages, max_tokens=2000):
+    """LLM call with full conversation history. Tries JSON mode first."""
     from openai import OpenAI
     client = OpenAI(base_url=config.LLM_BASE_URL, api_key=config.LLM_API_KEY)
-    r = client.chat.completions.create(
-        model=config.LLM_MODEL, max_tokens=max_tokens,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}])
+
+    kwargs = dict(model=config.LLM_MODEL, max_tokens=max_tokens, messages=messages)
+
+    # Try with JSON response format (OpenAI-compatible providers may support it)
+    try:
+        kwargs["response_format"] = {"type": "json_object"}
+        r = client.chat.completions.create(**kwargs)
+        return r.choices[0].message.content
+    except Exception:
+        pass
+
+    # Fallback without JSON mode
+    kwargs.pop("response_format", None)
+    r = client.chat.completions.create(**kwargs)
     return r.choices[0].message.content
 
 
+def _llm_call(system, user, max_tokens=2000):
+    """Standalone LLM call (backward compat)."""
+    messages = [{"role": "system", "content": system},
+                {"role": "user", "content": user}]
+    return _llm_call_conversation(messages, max_tokens)
+
+
+# ── Response Parsing ─────────────────────────────────────
+
 def _extract_code(text):
+    """Extract code from ```python blocks."""
     if "```python" in text:
         s = text.index("```python") + len("```python")
         e = text.index("```", s)
@@ -65,8 +102,69 @@ def _extract_code(text):
     return text
 
 
-def evaluate_fingan(code, name, device):
-    """Load loss, validate with FinGAN interface, train on 3 tickers."""
+def _parse_response(text):
+    """Parse LLM response: try JSON first, fallback to regex.
+
+    Returns dict with keys: thought, name, code.
+    """
+    # 1. Try direct JSON parse
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and "code" in data:
+            data.setdefault("name", "unnamed")
+            data.setdefault("thought", "")
+            return data
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # 2. Try to find JSON block embedded in markdown ```json ... ```
+    for pattern in [r'```json\s*([\s\S]*?)```', r'```\s*(\{[\s\S]*?\})\s*```']:
+        m = re.search(pattern, text)
+        if m:
+            try:
+                data = json.loads(m.group(1))
+                if isinstance(data, dict) and "code" in data:
+                    data.setdefault("name", "unnamed")
+                    data.setdefault("thought", "")
+                    return data
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+    # 3. Try to find a bare JSON object in text
+    # Match outermost { ... } that contains "code"
+    brace_depth = 0
+    json_start = None
+    for i, ch in enumerate(text):
+        if ch == '{':
+            if brace_depth == 0:
+                json_start = i
+            brace_depth += 1
+        elif ch == '}':
+            brace_depth -= 1
+            if brace_depth == 0 and json_start is not None:
+                candidate = text[json_start:i+1]
+                if '"code"' in candidate:
+                    try:
+                        data = json.loads(candidate)
+                        if isinstance(data, dict) and "code" in data:
+                            data.setdefault("name", "unnamed")
+                            data.setdefault("thought", "")
+                            return data
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                json_start = None
+
+    # 4. Fallback: extract code block + name via regex
+    code = _extract_code(text)
+    m = re.search(r'[Nn]ame[:\s]+[`"]*(\w+)[`"]*', text)
+    name = m.group(1) if m else "unnamed"
+    return {"thought": text[:300], "name": name, "code": code}
+
+
+# ── Evaluation ───────────────────────────────────────────
+
+def evaluate_fingan(code, name, device, n_seeds=3):
+    """Load loss, validate, train on 3 tickers x n_seeds seeds."""
     name = _sanitize_name(name)
     err = _scan_code_safety(code)
     if err:
@@ -92,18 +190,23 @@ def evaluate_fingan(code, name, device):
     except Exception as e:
         return {"loss_name": name, "mean_sr": -999, "error": f"validate: {e}", "code": code}
 
-    # Train on 3 tickers
+    # Train on 3 tickers x n_seeds seeds
+    seeds = list(range(42, 42 + n_seeds))
     per_ticker = {}
     for ticker in config.STAGE1_TICKERS:
-        try:
-            r = train_single_ticker_fingan(
-                ticker=ticker, financial_loss_fn=fn,
-                max_epochs=100, warmup_epochs=15,
-                eval_every=20, patience=6,
-                device=device, verbose=False)
-            per_ticker[ticker] = r["val_sr"]
-        except Exception as e:
-            per_ticker[ticker] = -999
+        sr_per_seed = []
+        for seed in seeds:
+            try:
+                r = train_single_ticker_fingan(
+                    ticker=ticker, financial_loss_fn=fn,
+                    max_epochs=100, warmup_epochs=15,
+                    eval_every=20, patience=6,
+                    device=device, verbose=False, seed=seed)
+                sr_per_seed.append(r["val_sr"])
+            except Exception:
+                sr_per_seed.append(-999)
+        valid_sr = [s for s in sr_per_seed if s > -900]
+        per_ticker[ticker] = float(np.mean(valid_sr)) if valid_sr else -999
 
     valid = [v for v in per_ticker.values() if v > -900]
     mean_sr = float(np.mean(valid)) if valid else -999
@@ -111,104 +214,35 @@ def evaluate_fingan(code, name, device):
     return {"loss_name": name, "mean_sr": mean_sr, "per_ticker": per_ticker, "code": code}
 
 
-# ── Reflection ───────────────────────────────────────────
-
-def reflect(best_result, worst_result):
-    """LLM reflects on best vs worst loss: WHY did one work and other fail?"""
-    prompt = f"""Analyze these two loss functions and their results.
-
-## Best Loss: {best_result['loss_name']} (SR={best_result['mean_sr']:.4f})
-Per-ticker: {json.dumps(best_result.get('per_ticker', {}))}
-```python
-{best_result.get('code', 'N/A')}
-```
-
-## Worst Loss: {worst_result['loss_name']} (SR={worst_result['mean_sr']:.4f})
-Per-ticker: {json.dumps(worst_result.get('per_ticker', {}))}
-```python
-{worst_result.get('code', 'N/A')}
-```
-
-## Task
-1. WHY does the best loss work better? Identify the specific mechanism.
-2. WHY does the worst loss fail? What goes wrong?
-3. What pattern should the next loss exploit?
-
-Be specific about which loss TERMS and WEIGHTS matter."""
-
-    return _llm_call(LOSS_SYSTEM, prompt, max_tokens=1000)
-
-
-def propose_with_reflection(all_results, reflection, round_num):
-    """Propose a new loss based on reflection insights."""
-    sorted_r = sorted(all_results, key=lambda x: -x.get("mean_sr", -999))
-
-    history = "\n".join(
-        f"  {i+1}. {r['loss_name']:25s} SR={r.get('mean_sr',0):.4f}"
-        for i, r in enumerate(sorted_r[:10])
-    )
-
-    # Include top-3 code
-    top_code = "\n\n".join(
-        f"### {r['loss_name']} (SR={r.get('mean_sr',0):.4f})\n```python\n{r.get('code','N/A')}\n```"
-        for r in sorted_r[:3] if r.get("code")
-    )
-
-    prompt = f"""## Evolution Round {round_num}
-
-## Leaderboard (top 10):
-{history}
-
-## Top-3 Source Code:
-{top_code}
-
-## Reflection from Previous Round:
-{reflection}
-
-## Task
-Based on the reflection above, propose a NEW loss function that:
-1. Exploits the patterns identified in the reflection
-2. Addresses the weaknesses found
-3. Is meaningfully different from existing losses
-
-Output: name (snake_case), reasoning (2 sentences), then Python code block."""
-
-    text = _llm_call(LOSS_SYSTEM, prompt)
-    code = _extract_code(text)
-
-    import re
-    m = re.search(r'[Nn]ame[:\s]+[`"]*(\w+)[`"]*', text)
-    name = m.group(1) if m else f"round_{round_num}"
-
-    return {"name": name, "code": code, "reasoning": text[:300]}
-
-
 # ── Main ─────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rounds", type=int, default=20)
+    parser.add_argument("--n_seeds", type=int, default=3)
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to messages.json to resume from")
     args = parser.parse_args()
 
+    n_seeds = args.n_seeds
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    results_dir = os.path.join(config.RESULTS_DIR, "llm_fingan")
+    results_dir = os.path.join(config.RESULTS_DIR, "llm_fingan_v2")
     os.makedirs(results_dir, exist_ok=True)
 
     all_results = []
+    baseline_sr = None
 
-    # Evaluate baselines
+    # ── Evaluate baselines ───────────────────────────────
     print("=== Evaluating baselines ===")
-    registry = LossRegistry()
     from losses.fingan_baselines import FINGAN_BASELINES
 
     for bname, bfn in FINGAN_BASELINES.items():
         print(f"\n--- {bname} ---")
-        # Wrap baseline to FinGAN interface
         def make_fingan_fn(base_fn):
             def fingan_fn(gen_out, real, tanh_temp):
                 x_pred = gen_out.unsqueeze(-1) if gen_out.dim() == 1 else gen_out
@@ -220,72 +254,150 @@ def main():
 
         fingan_fn = make_fingan_fn(bfn)
         per_ticker = {}
+        seeds = list(range(42, 42 + n_seeds))
         for ticker in config.STAGE1_TICKERS:
-            r = train_single_ticker_fingan(
-                ticker=ticker, financial_loss_fn=fingan_fn,
-                max_epochs=100, warmup_epochs=15,
-                eval_every=20, patience=6,
-                device=device, verbose=True)
-            per_ticker[ticker] = r["val_sr"]
+            sr_per_seed = []
+            for seed in seeds:
+                r = train_single_ticker_fingan(
+                    ticker=ticker, financial_loss_fn=fingan_fn,
+                    max_epochs=100, warmup_epochs=15,
+                    eval_every=20, patience=6,
+                    device=device, verbose=(seed == 42), seed=seed)
+                sr_per_seed.append(r["val_sr"])
+            per_ticker[ticker] = float(np.mean(sr_per_seed))
 
         mean_sr = float(np.mean(list(per_ticker.values())))
         result = {"loss_name": bname, "mean_sr": mean_sr, "per_ticker": per_ticker, "origin": "baseline"}
         all_results.append(result)
         print(f"  Mean SR: {mean_sr:.4f}")
 
+        if bname == "velocity_only":
+            baseline_sr = mean_sr
+
+    if baseline_sr is None or baseline_sr <= 0:
+        baseline_sr = max(r["mean_sr"] for r in all_results if r["mean_sr"] > -900) or 1.0
+
     # Leaderboard
     sorted_r = sorted(all_results, key=lambda x: -x["mean_sr"])
     print(f"\n{'='*50}")
-    print("BASELINE LEADERBOARD")
+    print("BASELINE LEADERBOARD (normalized by velocity_only)")
     for i, r in enumerate(sorted_r):
-        print(f"  {i+1}. {r['loss_name']:25s} SR={r['mean_sr']:.4f}")
+        norm = r["mean_sr"] / baseline_sr
+        print(f"  {i+1}. {r['loss_name']:25s} SR={r['mean_sr']:.4f} (norm={norm:.3f})")
 
-    # LLM evolution with reflection
-    print(f"\n=== LLM Evolution with Reflection ({args.rounds} rounds) ===")
-    reflection = "No reflection yet. This is the first round."
+    # ── Build archive for initial prompt ─────────────────
+    archive_lines = []
+    for r in sorted_r:
+        norm = r["mean_sr"] / baseline_sr
+        archive_lines.append(
+            f"  {r['loss_name']:25s} SR={r['mean_sr']:.4f} (norm={norm:.3f}) "
+            f"per_ticker={json.dumps(r.get('per_ticker', {}))}"
+        )
+    archive_str = "\n".join(archive_lines)
 
-    for rnd in range(1, args.rounds + 1):
+    # ── Initialize conversation ──────────────────────────
+    if args.resume and os.path.exists(args.resume):
+        with open(args.resume) as f:
+            messages = json.load(f)
+        start_round = len([m for m in messages if m["role"] == "assistant"]) + 1
+        print(f"\nResumed from {args.resume}, starting at round {start_round}")
+    else:
+        messages = [{"role": "system", "content": LOSS_SYSTEM_V2}]
+        first_prompt = (
+            f"Here are the baseline results (normalized SR = raw SR / velocity_only SR):\n"
+            f"{archive_str}\n\n"
+            f"The velocity_only baseline (BCE loss only, no financial terms) has "
+            f"SR={baseline_sr:.4f} (normalized=1.000).\n"
+            f"Any loss with normalized SR > 1.0 improves over the baseline.\n\n"
+            f"Please generate a novel loss function that beats the best baseline.\n"
+            f'Respond with JSON: {{"thought": "...", "name": "...", "code": "..."}}'
+        )
+        messages.append({"role": "user", "content": first_prompt})
+        start_round = 1
+
+    # ── LLM Evolution with Conversation History ──────────
+    print(f"\n=== LLM Evolution v2 ({args.rounds} rounds, {n_seeds} seeds) ===")
+
+    for rnd in range(start_round, args.rounds + 1):
         print(f"\n{'#'*60}")
         print(f"  ROUND {rnd}/{args.rounds}")
         print(f"{'#'*60}")
 
-        # Step 1: Reflect on best vs worst
-        valid = [r for r in all_results if r.get("mean_sr", -999) > -900]
-        if len(valid) >= 2:
-            best = max(valid, key=lambda x: x["mean_sr"])
-            worst = min(valid, key=lambda x: x["mean_sr"])
-            print(f"  Reflecting: best={best['loss_name']}({best['mean_sr']:.3f}) vs worst={worst['loss_name']}({worst['mean_sr']:.3f})")
-            reflection = reflect(best, worst)
-            print(f"  Reflection: {reflection[:200]}...")
+        # LLM proposes (sees full conversation history)
+        t0 = time.time()
+        response_text = _llm_call_conversation(messages, max_tokens=2000)
+        llm_time = time.time() - t0
+        messages.append({"role": "assistant", "content": response_text})
 
-        # Step 2: Propose based on reflection
-        proposal = propose_with_reflection(all_results, reflection, rnd)
-        name = proposal["name"]
-        code = proposal["code"]
-        print(f"  Proposed: '{name}'")
+        # Parse response (JSON -> fallback regex)
+        parsed = _parse_response(response_text)
+        name = _sanitize_name(parsed.get("name", f"round_{rnd}"))
+        code = parsed.get("code", "")
+        thought = parsed.get("thought", "")
 
-        # Step 3: Evaluate
-        result = evaluate_fingan(code, name, device)
+        print(f"  Thought: {thought[:200]}...")
+        print(f"  Proposed: '{name}' (LLM {llm_time:.1f}s)")
+
+        # Evaluate
+        result = evaluate_fingan(code, name, device, n_seeds=n_seeds)
         result["origin"] = "llm"
-        result["reasoning"] = proposal["reasoning"]
+        result["thought"] = thought
         result["code"] = code
         all_results.append(result)
-        print(f"  Mean SR: {result['mean_sr']:.4f}")
 
-        # Save
+        norm_sr = result["mean_sr"] / baseline_sr
+        print(f"  Mean SR: {result['mean_sr']:.4f} (norm={norm_sr:.3f})")
+
+        # Feed evaluation back into conversation
+        if result["mean_sr"] > -900:
+            above_below = "ABOVE" if norm_sr > 1.0 else "BELOW"
+            feedback = (
+                f"Evaluation result for '{name}':\n"
+                f"  Mean SR: {result['mean_sr']:.4f} (normalized: {norm_sr:.3f}, {above_below} baseline)\n"
+                f"  Per-ticker: {json.dumps(result.get('per_ticker', {}))}\n"
+                f"\nCurrent leaderboard (top 5):\n"
+            )
+            top5 = sorted(all_results, key=lambda x: -x.get("mean_sr", -999))[:5]
+            for i, r in enumerate(top5):
+                n = r.get("mean_sr", 0) / baseline_sr
+                key = r.get("loss_name", r.get("name", "?"))
+                feedback += f"  {i+1}. {key:25s} SR={r.get('mean_sr',0):.4f} (norm={n:.3f})\n"
+            feedback += (
+                f"\nPlease analyze why this result occurred and propose a better loss function.\n"
+                f'Respond with JSON: {{"thought": "...", "name": "...", "code": "..."}}'
+            )
+        else:
+            error = result.get("error", "unknown")
+            feedback = (
+                f"The loss '{name}' FAILED: {error}\n"
+                f"Please analyze the failure and propose a corrected loss function.\n"
+                f'Respond with JSON: {{"thought": "...", "name": "...", "code": "..."}}'
+            )
+
+        messages.append({"role": "user", "content": feedback})
+
+        # Save per-round result + conversation state
         with open(os.path.join(results_dir, f"round_{rnd:03d}_{name}.json"), "w") as f:
             json.dump(result, f, indent=2, default=str)
+        with open(os.path.join(results_dir, "messages.json"), "w") as f:
+            json.dump(messages, f, indent=2, default=str)
 
-    # Final leaderboard
+    # ── Final leaderboard ────────────────────────────────
     sorted_r = sorted(all_results, key=lambda x: -x.get("mean_sr", -999))
     print(f"\n{'='*60}")
-    print(f"{'LLM+REFLECTION FINAL':^60}")
+    print(f"{'LLM+CONVERSATION v2 FINAL':^60}")
     print(f"{'='*60}")
     for i, r in enumerate(sorted_r[:20]):
-        print(f"  {i+1}. {r['loss_name']:25s} SR={r.get('mean_sr',0):.4f} ({r.get('origin','?')})")
+        norm = r.get("mean_sr", 0) / baseline_sr
+        key = r.get("loss_name", r.get("name", "?"))
+        print(f"  {i+1}. {key:25s} SR={r.get('mean_sr',0):.4f} (norm={norm:.3f}) ({r.get('origin','?')})")
 
     with open(os.path.join(results_dir, "final.json"), "w") as f:
-        json.dump(sorted_r[:50], f, indent=2, default=str)
+        json.dump({
+            "baseline_sr": baseline_sr,
+            "n_seeds": n_seeds,
+            "results": sorted_r[:50],
+        }, f, indent=2, default=str)
 
 
 if __name__ == "__main__":
