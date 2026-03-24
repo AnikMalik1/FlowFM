@@ -161,8 +161,9 @@ def train_one_ticker(
 
     # PnL auxiliary loss config
     lambda_pnl = 10.0       # weight of PnL loss (FM loss ~1.0, PnL loss ~0.01)
-    tanh_temp = 100.0        # tanh temperature for soft sign
+    tanh_temp = 20.0         # tanh temperature (softer than 100, bounded gradients)
     pnl_warmup_epochs = 50   # pure FM loss for first N epochs before adding PnL
+    pnl_ramp_epochs = 20     # linearly ramp lambda from 0 to lambda_pnl over this many epochs
 
     eval_every = 10
     val_nsamp_ckpt = 1024
@@ -236,7 +237,7 @@ def train_one_ticker(
         c = cond_train[perm]
         x = x1_train[perm]
 
-        losses = []
+        losses, losses_fm, losses_pnl = [], [], []
 
         for i in range(0, N, batch_size):
             c_b = c[i:i + batch_size]
@@ -249,30 +250,35 @@ def train_one_ticker(
             for pg in opt.param_groups:
                 pg["lr"] = lr * mult
 
-            # Denormalize target for PnL computation
-            x_b_real = x_b * sd_x + mu_x
-
             opt.zero_grad(set_to_none=True)
 
-            use_pnl = (ep > pnl_warmup_epochs)
+            # Curriculum: ramp lambda from 0 to lambda_pnl over pnl_ramp_epochs
+            if ep <= pnl_warmup_epochs:
+                lambda_eff = 0.0
+            else:
+                ramp_progress = min(1.0, (ep - pnl_warmup_epochs) / max(1, pnl_ramp_epochs))
+                lambda_eff = lambda_pnl * ramp_progress
 
-            if use_amp:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    if use_pnl:
+            if lambda_eff > 0:
+                x_b_real = x_b * sd_x + mu_x
+                if use_amp:
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         loss, loss_fm, loss_pnl = fm_batch_loss_pnl(
                             model, x_b, c_b, x_b_real,
-                            lambda_pnl=lambda_pnl, tanh_temp=tanh_temp,
+                            lambda_pnl=lambda_eff, tanh_temp=tanh_temp,
                         )
-                    else:
-                        loss = fm_batch_loss(model, x_b, c_b)
-            else:
-                if use_pnl:
+                else:
                     loss, loss_fm, loss_pnl = fm_batch_loss_pnl(
                         model, x_b, c_b, x_b_real,
-                        lambda_pnl=lambda_pnl, tanh_temp=tanh_temp,
+                        lambda_pnl=lambda_eff, tanh_temp=tanh_temp,
                     )
+            else:
+                if use_amp:
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        loss = fm_batch_loss(model, x_b, c_b)
                 else:
                     loss = fm_batch_loss(model, x_b, c_b)
+                loss_fm, loss_pnl = loss, torch.tensor(0.0)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -281,12 +287,17 @@ def train_one_ticker(
             ema.update(model)
             global_step += 1
             losses.append(float(loss.item()))
+            losses_fm.append(float(loss_fm.item()))
+            losses_pnl.append(float(loss_pnl.item()))
 
         mean_loss = float(np.mean(losses))
 
         if ep % 10 == 0:
-            pnl_tag = " +PnL" if ep > pnl_warmup_epochs else " (FM only)"
-            print(f"{ticker} | epoch {ep:4d} | loss {mean_loss:.6f} | lr {opt.param_groups[0]['lr']:.2e}{pnl_tag}")
+            if lambda_eff > 0:
+                pnl_tag = f" +PnL(λ={lambda_eff:.1f})"
+                print(f"{ticker} | epoch {ep:4d} | total={mean_loss:.5f} fm={np.mean(losses_fm):.5f} pnl={np.mean(losses_pnl):.5f} | lr {opt.param_groups[0]['lr']:.2e}{pnl_tag}")
+            else:
+                print(f"{ticker} | epoch {ep:4d} | loss {mean_loss:.6f} | lr {opt.param_groups[0]['lr']:.2e} (FM only)")
 
         if ep % eval_every == 0:
             eval_model = make_model(l=l, hidden=hidden, depth=depth, dropout=dropout, device=device)
@@ -407,8 +418,8 @@ def main():
     print("Number of tickers:", len(tickers))
     print("Tickers:", tickers)
 
-    out_csv = os.path.join(loc, "Results", "flowfm_aux_31.csv")
-    portfolio_csv = os.path.join(loc, "Results", "flowfm_aux_31_portfolio_summary.csv")
+    out_csv = os.path.join(loc, "Results", "flowfm_pnl_31.csv")
+    portfolio_csv = os.path.join(loc, "Results", "flowfm_pnl_31_portfolio_summary.csv")
 
     existing = pd.DataFrame()
     done_tickers = set()
