@@ -160,8 +160,7 @@ def train_one_ticker(
     cond_noise_std = 0.02
 
     # PnL auxiliary loss config
-    lambda_pnl = 10.0       # weight of PnL loss (FM loss ~1.0, PnL loss ~0.01)
-    tanh_temp = 20.0         # tanh temperature (softer than 100, bounded gradients)
+    lambda_pnl = 50.0        # weight of PnL loss (linear proxy ~0.0001, need large lambda)
     pnl_warmup_epochs = 50   # pure FM loss for first N epochs before adding PnL
     pnl_ramp_epochs = 20     # linearly ramp lambda from 0 to lambda_pnl over this many epochs
 
@@ -265,7 +264,7 @@ def train_one_ticker(
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         loss, loss_fm, loss_pnl = fm_batch_loss_pnl(
                             model, x_b, c_b, x_b_real,
-                            lambda_pnl=lambda_eff, tanh_temp=tanh_temp,
+                            lambda_pnl=lambda_eff,
                         )
                 else:
                     loss, loss_fm, loss_pnl = fm_batch_loss_pnl(

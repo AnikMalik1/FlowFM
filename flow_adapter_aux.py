@@ -127,7 +127,6 @@ def fm_batch_loss_pnl(
     cond: torch.Tensor,
     x1_real: torch.Tensor,
     lambda_pnl: float = 10.0,
-    tanh_temp: float = 20.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Flow matching loss + differentiable PnL auxiliary loss.
@@ -156,16 +155,12 @@ def fm_batch_loss_pnl(
     # x1_hat = x_t + (1-t) * v_pred  (first-order extrapolation to t=1)
     x1_hat_n = x_t + (1.0 - t)[:, None] * v_pred
 
-    # Denormalize the prediction so both sides are in the same space.
-    # mu_x/sd_x are scalars extracted from x1_real stats; for financial
-    # returns mu_x << sd_x so sign is preserved, but denormalizing is
-    # cleaner and eliminates the edge case entirely.
-    x1_hat_real = x1_hat_n * (x1_real.std() + 1e-8) + x1_real.mean()
-
-    # Differentiable PnL: tanh(T * predicted_return) * actual_return
-    # tanh_temp=20 saturates for |x|>0.15 (soft sign with bounded gradients)
-    # Lower temp avoids gradient spikes near zero that tanh_temp=100 creates
-    pnl_proxy = torch.tanh(tanh_temp * x1_hat_real) * x1_real
+    # Linear PnL proxy: x1_hat * x1_real (no tanh, no saturation)
+    # Gradient always flows: d(loss)/d(v_pred) = -(1-t) * x1_real
+    # Rewards directional correctness weighted by actual return magnitude.
+    # Unlike tanh(100*x) which saturates and kills gradients, this has
+    # uniform gradient flow everywhere.
+    pnl_proxy = x1_hat_n * x1_real
     loss_pnl = -torch.mean(pnl_proxy)  # negative because we maximize PnL
 
     total = loss_fm + lambda_pnl * loss_pnl
