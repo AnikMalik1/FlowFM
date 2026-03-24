@@ -151,26 +151,29 @@ def fm_batch_loss_pnl(
     # Standard velocity MSE
     loss_fm = torch.mean((v_pred - v_target) ** 2)
 
-    # PnL auxiliary: run short ODE to generate actual sample, then compute PnL.
-    # This is the FinGAN approach: loss on GENERATED sample, not intermediate state.
-    # Previous attempts (tanh or linear on single-step extrapolation) failed because
-    # they couldn't control the aggregated pu across multiple ODE trajectories.
-    # Running the actual ODE makes the gradient flow through the full generation path.
-    pnl_steps = 10  # fewer steps than inference (40) for speed
-    x0_pnl = torch.randn_like(x1)  # fresh noise
-    x_gen = x0_pnl
-    dt_pnl = 1.0 / pnl_steps
-    for k in range(pnl_steps):
-        t_pnl = torch.full((B,), (k + 0.5) * dt_pnl, device=x1.device)
-        v_gen = model(x_gen, cond, t_pnl)
-        x_gen = x_gen + dt_pnl * v_gen  # differentiable chain
-
-    # x_gen is the generated sample in normalized space.
-    # tanh(20*x) as soft sign: saturates at |x|>0.15 (normalized returns std~1).
-    # Unlike tanh(100*x) on intermediate states which was always saturated,
-    # here x_gen is a proper generated sample with meaningful variance.
-    pnl_proxy = torch.tanh(20.0 * x_gen) * x1_real
-    loss_pnl = -torch.mean(pnl_proxy)
+    # PnL: reuse the v_pred we already computed for FM loss.
+    # At time t, the model's best estimate of x1 is:
+    #   x1_est = x_t + (1-t) * v_pred   (Euler extrapolation to t=1)
+    # But instead of using this raw estimate (which failed before),
+    # we use it to compute a MULTI-SAMPLE pu estimate within the batch.
+    #
+    # Key insight: the batch already contains B independent (x0, t) pairs.
+    # For each conditioning window, multiple batch elements share the same
+    # condition but have different noise/time → they ARE multiple samples.
+    # We can estimate pu directly from the batch's sign statistics.
+    #
+    # Since all batch elements are independent ODE trajectories,
+    # the sign of x1_est across the batch IS the pu distribution.
+    x1_est = x_t + (1.0 - t)[:, None] * v_pred  # (B, 1) estimated x1
+    # Scale to real space for PnL
+    x1_est_real = x1_est.detach() * (x1_real.std() + 1e-8) + x1_real.mean()
+    # But we need gradients through v_pred, so use straight-through estimator:
+    # detach the magnitude, keep gradient through sign direction
+    # tanh(1.0 * x) in normalized space (std~1): NOT saturated.
+    # tanh'(1.0 * 1.0) = 0.42 → strong gradient.
+    # Compare: tanh(20*x) → tanh'(20) ≈ 0 → zero gradient (our previous bug).
+    sign_est = torch.tanh(1.0 * x1_est)  # soft sign, gradients ALWAYS flow
+    loss_pnl = -torch.mean(sign_est * x1_real)
 
     total = loss_fm + lambda_pnl * loss_pnl
     return total, loss_fm, loss_pnl

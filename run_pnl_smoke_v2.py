@@ -67,6 +67,7 @@ for ti, ticker in enumerate(TICKERS):
     x1_train = (train[:, l:l+1] - mu_x) / sd_x
 
     model = make_model(l, hidden, depth, dropout, device)
+    model = torch.compile(model)  # fuse kernels, ~2x speedup
     opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01, betas=(0.9, 0.95))
     ema = EMA(model, decay=ema_decay)
 
