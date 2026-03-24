@@ -1,0 +1,68 @@
+#!/bin/bash
+#SBATCH --account=brics.s5e
+#SBATCH --partition=workq
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=72
+#SBATCH --gres=gpu:1
+#SBATCH --time=04:00:00
+#SBATCH --output=results/evolve_%j.out
+#SBATCH --error=results/evolve_%j.err
+
+set -euo pipefail
+
+# ── Conda ───────────────────────────────────────────────
+source /projects/s5e/quant/miniforge3/etc/profile.d/conda.sh
+conda activate base
+
+# ── Antigravity Manager (LLM API proxy) ────────────────
+# Start in background, wait for it to be ready
+echo "[$(date)] Starting Antigravity Manager..."
+apptainer run \
+    --env API_KEY="${LLM_API_KEY:-sk-c95e13f4ccea4d91ae24e4c132fd6971}" \
+    --env ABV_PORT="${LLM_PORT:-18045}" \
+    --env ABV_BIND_LOCAL_ONLY=true \
+    /projects/s5e/quant/antigravity-manager_latest.sif &
+AG_PID=$!
+
+# Wait for API to be ready
+for i in $(seq 1 30); do
+    if curl -s --connect-timeout 2 http://127.0.0.1:${LLM_PORT:-18045}/v1/models > /dev/null 2>&1; then
+        echo "[$(date)] Antigravity Manager ready (attempt $i)"
+        break
+    fi
+    sleep 2
+done
+
+# Verify
+if ! curl -s --connect-timeout 5 http://127.0.0.1:${LLM_PORT:-18045}/v1/models > /dev/null 2>&1; then
+    echo "[$(date)] ERROR: Antigravity Manager failed to start"
+    kill $AG_PID 2>/dev/null
+    exit 1
+fi
+
+# ── GPU info ────────────────────────────────────────────
+echo "[$(date)] GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
+echo "[$(date)] CUDA visible: ${CUDA_VISIBLE_DEVICES:-all}"
+
+# ── Run evolution ───────────────────────────────────────
+cd /projects/s5e/quant/fingan/meta_loss
+
+echo "[$(date)] Starting evolution: MODE=${MODE:-baselines-only} ROUNDS=${ROUNDS:-10}"
+
+if [ "${MODE:-baselines-only}" = "baselines-only" ]; then
+    python3 evolve.py --baselines-only
+elif [ "${MODE:-baselines-only}" = "evolve" ]; then
+    python3 evolve.py --rounds "${ROUNDS:-10}" --resume
+else
+    python3 evolve.py "$@"
+fi
+
+EXIT_CODE=$?
+echo "[$(date)] Evolution finished with exit code $EXIT_CODE"
+
+# Cleanup
+kill $AG_PID 2>/dev/null
+wait $AG_PID 2>/dev/null
+
+exit $EXIT_CODE
