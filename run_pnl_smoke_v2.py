@@ -44,7 +44,7 @@ patience_evals = 8
 hid_g, z_dim = 8, 8
 
 # PnL config (ODE-through PnL, like FinGAN's direct sample loss)
-lambda_pnl = 1.0           # lower lambda since ODE-through gradient is stronger
+lambda_pnl = 1000.0        # FM~1.0, PnL~0.001 → need 1000x to balance
 pnl_warmup_epochs = 50
 pnl_ramp_epochs = 20
 
