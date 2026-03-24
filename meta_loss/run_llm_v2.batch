@@ -12,16 +12,10 @@
 set -euo pipefail
 
 # ── Python env ──────────────────────────────────────────
-# conda shebangs are stale; set PATH + all lib dirs explicitly
-MF=/projects/s5e/quant/miniforge3
-export PATH="$MF/bin:$PATH"
-export CONDA_PREFIX="$MF"
-# torch CUDA deps live in nvidia/*/lib and torch/lib
-EXTRA_LIBS="$MF/lib"
-for d in $MF/lib/python3.12/site-packages/nvidia/*/lib $MF/lib/python3.12/site-packages/torch/lib; do
-    [ -d "$d" ] && EXTRA_LIBS="$EXTRA_LIBS:$d"
-done
-export LD_LIBRARY_PATH="$EXTRA_LIBS:${LD_LIBRARY_PATH:-}"
+# Only set PATH. Do NOT set LD_LIBRARY_PATH — torch uses RUNPATH ($ORIGIN/lib)
+# and compute nodes have system CUDA. Setting LD_LIBRARY_PATH overrides RUNPATH
+# and causes pip nvidia/ packages to conflict with system CUDA libs.
+export PATH="/projects/s5e/quant/miniforge3/bin:$PATH"
 echo "[$(date)] Python: $(python3 --version) at $(which python3)"
 
 # ── Antigravity Manager (LLM API proxy) ────────────────
