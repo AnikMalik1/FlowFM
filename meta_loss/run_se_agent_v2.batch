@@ -1,0 +1,60 @@
+#!/bin/bash
+#SBATCH --account=brics.s5e
+#SBATCH --partition=workq
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=72
+#SBATCH --gres=gpu:1
+#SBATCH --time=02:00:00
+#SBATCH --output=results/se_agent_v2_%j.out
+#SBATCH --error=results/se_agent_v2_%j.err
+
+set -euo pipefail
+
+# ── Conda ───────────────────────────────────────────────
+source /projects/s5e/quant/miniforge3/etc/profile.d/conda.sh 2>/dev/null || true
+export PATH="/projects/s5e/quant/miniforge3/bin:$PATH"
+conda activate base
+
+# ── Antigravity Manager (LLM API proxy) ────────────────
+echo "[$(date)] Starting Antigravity Manager..."
+apptainer run \
+    --env API_KEY="${LLM_API_KEY:-sk-c95e13f4ccea4d91ae24e4c132fd6971}" \
+    --env ABV_PORT="${LLM_PORT:-18045}" \
+    --env ABV_BIND_LOCAL_ONLY=true \
+    /projects/s5e/quant/antigravity-manager_latest.sif > /dev/null 2>&1 &
+AG_PID=$!
+
+for i in $(seq 1 30); do
+    if curl -s --connect-timeout 2 http://127.0.0.1:${LLM_PORT:-18045}/v1/models > /dev/null 2>&1; then
+        echo "[$(date)] Antigravity Manager ready (attempt $i)"
+        break
+    fi
+    sleep 2
+done
+
+if ! curl -s --connect-timeout 5 http://127.0.0.1:${LLM_PORT:-18045}/v1/models > /dev/null 2>&1; then
+    echo "[$(date)] ERROR: Antigravity Manager failed to start"
+    kill $AG_PID 2>/dev/null
+    exit 1
+fi
+
+# ── GPU info ────────────────────────────────────────────
+echo "[$(date)] GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
+
+# ── Run SE-Agent v2 ─────────────────────────────────────
+cd /projects/s5e/quant/fingan/FlowFM_v2/meta_loss
+
+CYCLES=${CYCLES:-3}
+INITIAL=${INITIAL:-5}
+N_SEEDS=${N_SEEDS:-3}
+
+echo "[$(date)] Starting SE-Agent v2: CYCLES=$CYCLES INITIAL=$INITIAL N_SEEDS=$N_SEEDS"
+python3 se_agent_evolve.py --cycles "$CYCLES" --initial "$INITIAL" --n_seeds "$N_SEEDS"
+
+EXIT_CODE=$?
+echo "[$(date)] SE-Agent v2 finished with exit code $EXIT_CODE"
+
+kill $AG_PID 2>/dev/null
+wait $AG_PID 2>/dev/null
+exit $EXIT_CODE
