@@ -2,12 +2,55 @@
 Loss Registry — stores and manages loss functions (baselines + evolved).
 """
 import os
-import json
+import re
 import importlib.util
 from typing import Callable, Optional
 
 from losses.fingan_baselines import FINGAN_BASELINES
 import config
+
+# Imports that LLM-generated code is NOT allowed to use
+BANNED_IMPORTS = {
+    "os", "sys", "subprocess", "socket", "shutil", "pathlib",
+    "http", "urllib", "requests", "ctypes", "signal",
+    "multiprocessing", "threading", "pickle", "shelve",
+    "importlib", "builtins", "code", "codeop", "compile",
+}
+BANNED_PATTERNS = [
+    r"\beval\s*\(",
+    r"\bexec\s*\(",
+    r"\bopen\s*\(",
+    r"\b__import__\s*\(",
+    r"\bgetattr\s*\(",
+    r"\bglobals\s*\(",
+    r"\bcompile\s*\(",
+]
+
+
+def _sanitize_name(name: str) -> str:
+    """Allow only alphanumeric + underscore in loss names."""
+    cleaned = re.sub(r"[^a-zA-Z0-9_]", "", name)
+    if not cleaned:
+        cleaned = "unnamed_loss"
+    return cleaned
+
+
+def _scan_code_safety(code: str) -> Optional[str]:
+    """Static scan for dangerous patterns before execution. Returns error or None."""
+    for line in code.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        # Check imports
+        if stripped.startswith(("import ", "from ")):
+            for banned in BANNED_IMPORTS:
+                if re.search(rf"\b{banned}\b", stripped):
+                    return f"Banned import detected: '{banned}' in '{stripped}'"
+        # Check dangerous builtins
+        for pattern in BANNED_PATTERNS:
+            if re.search(pattern, stripped):
+                return f"Banned pattern detected: '{pattern}' in '{stripped}'"
+    return None
 
 
 class LossRegistry:
@@ -15,7 +58,7 @@ class LossRegistry:
 
     def __init__(self):
         self._fns: dict[str, Callable] = {}
-        self._meta: dict[str, dict] = {}  # name -> {source, description, origin}
+        self._meta: dict[str, dict] = {}
         self._load_baselines()
 
     def _load_baselines(self):
@@ -52,12 +95,20 @@ class LossRegistry:
         Register a loss function from Python source code string.
         Returns None on success, error message on failure.
         """
+        # C1 fix: sanitize name (prevent path traversal)
+        name = _sanitize_name(name)
+
+        # C1 fix: static safety scan before any execution
+        safety_err = _scan_code_safety(code)
+        if safety_err:
+            return f"Safety scan failed for '{name}': {safety_err}"
+
         # Save to file
         path = os.path.join(config.LOSSES_DIR, f"{name}.py")
         with open(path, "w") as f:
             f.write(code)
 
-        # Try to load it
+        # Load with importlib
         try:
             spec = importlib.util.spec_from_file_location(name, path)
             mod = importlib.util.module_from_spec(spec)
@@ -97,6 +148,10 @@ class LossRegistry:
                 return f"loss_fn must return scalar, got shape {loss.shape}"
             if not loss.requires_grad:
                 return "loss_fn output is not differentiable"
+
+            # Check for NaN/Inf
+            if torch.isnan(loss) or torch.isinf(loss):
+                return f"loss_fn returned {loss.item()}"
 
             loss.backward()
             return None
