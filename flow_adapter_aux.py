@@ -121,6 +121,51 @@ def fm_batch_loss(model: nn.Module, x1: torch.Tensor, cond: torch.Tensor) -> tor
     return torch.mean((v_pred - v_target) ** 2)
 
 
+def fm_batch_loss_pnl(
+    model: nn.Module,
+    x1: torch.Tensor,
+    cond: torch.Tensor,
+    x1_real: torch.Tensor,
+    lambda_pnl: float = 10.0,
+    tanh_temp: float = 100.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Flow matching loss + differentiable PnL auxiliary loss.
+
+    The PnL term pushes the model to produce directionally biased samples,
+    fixing the pu~0.5 problem where flow matching faithfully learns a
+    symmetric distribution but produces tiny position sizes.
+
+    x1:      normalized target return (B,1)
+    cond:    normalized condition (B,l)
+    x1_real: denormalized target return (B,1) for PnL computation
+
+    Returns: (total_loss, fm_loss, pnl_loss)
+    """
+    B = x1.shape[0]
+    t = torch.rand((B,), device=x1.device).clamp(1e-4, 1.0 - 1e-4)
+    x0 = torch.randn_like(x1)
+    x_t = (1.0 - t)[:, None] * x0 + t[:, None] * x1
+    v_target = x1 - x0
+    v_pred = model(x_t, cond, t)
+
+    # Standard velocity MSE
+    loss_fm = torch.mean((v_pred - v_target) ** 2)
+
+    # PnL auxiliary: estimate x1 from current (x_t, v_pred)
+    # x1_hat = x_t + (1-t) * v_pred  (first-order extrapolation to t=1)
+    x1_hat_n = x_t + (1.0 - t)[:, None] * v_pred
+
+    # Differentiable PnL: tanh(T * predicted_sign) * real_return
+    # tanh(100*x) saturates to +/-1 for |x|>0.05, acting as soft sign
+    # Maximizing this = maximizing correct directional bets
+    pnl_proxy = torch.tanh(tanh_temp * x1_hat_n) * x1_real
+    loss_pnl = -torch.mean(pnl_proxy)  # negative because we maximize PnL
+
+    total = loss_fm + lambda_pnl * loss_pnl
+    return total, loss_fm, loss_pnl
+
+
 @torch.no_grad()
 def fm_sample_from_x0(model: nn.Module, x0: torch.Tensor, cond: torch.Tensor, n_steps: int = 40) -> torch.Tensor:
     """
