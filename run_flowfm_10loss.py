@@ -84,7 +84,7 @@ def loss_pnlsr(v_pred, v_target, x1_hat, x1_real, tanh_c=1.0):
 def loss_pnlstd(v_pred, v_target, x1_hat, x1_real, tanh_c=1.0):
     fm = torch.mean((v_pred - v_target) ** 2)
     pnl, _, _, std = _aux_terms(x1_hat, x1_real, tanh_c)
-    return fm + LAMBDA * (-torch.mean(torch.tanh(tanh_c * x1_hat.squeeze(-1)) * x1_real.squeeze(-1)) + std)
+    return fm + LAMBDA * (pnl + std)
 
 def loss_pnlmsesr(v_pred, v_target, x1_hat, x1_real, tanh_c=1.0):
     fm = torch.mean((v_pred - v_target) ** 2)
@@ -205,7 +205,7 @@ def train_one(gpu_id, ticker, ti):
 
             opt.zero_grad(set_to_none=True)
 
-            if True:  # fp32 for fair comparison with FinGAN (no bf16 autocast)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=False):  # fp32 for fair comparison with FinGAN
                 # Standard FM forward
                 B = x.shape[0]
                 t = torch.rand((B,), device=dev).clamp(1e-4, 1.0 - 1e-4)
