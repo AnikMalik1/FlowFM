@@ -80,23 +80,46 @@ Rules:
 # ── Evaluation ───────────────────────────────────────────
 
 def evaluate_loss(code: str, name: str, registry: LossRegistry, device) -> dict:
-    """Register, validate, and evaluate a loss on FinGAN (3 tickers)."""
-    err = registry.register_from_code(name, code, origin="se_agent")
+    """Load loss_fn from code, validate with FinGAN interface, evaluate on 3 tickers."""
+    from loss_registry import _scan_code_safety, _sanitize_name
+    import importlib.util
+
+    name = _sanitize_name(name)
+
+    # Safety scan
+    err = _scan_code_safety(code)
     if err:
-        return {"name": name, "sr": -999, "error": f"register: {err}", "code": code}
+        return {"name": name, "sr": -999, "error": f"safety: {err}", "code": code}
 
-    err = registry.validate_loss_fn(name)
-    if err:
-        return {"name": name, "sr": -999, "error": f"validate: {err}", "code": code}
+    # Write and load
+    path = os.path.join(config.LOSSES_DIR, f"{name}.py")
+    with open(path, "w") as f:
+        f.write(code)
+    try:
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        fn = mod.loss_fn
+    except Exception as e:
+        return {"name": name, "sr": -999, "error": f"load: {e}", "code": code}
 
-    fn = registry.get(name)
-    fingan_fn = _adapt_ga_genome_to_financial_loss(fn)
+    # Validate with FinGAN interface (gen_out, real, tanh_temp)
+    try:
+        test_out = torch.randn(32, requires_grad=True)
+        test_real = torch.randn(32)
+        loss = fn(test_out, test_real, 100.0)
+        if not isinstance(loss, torch.Tensor) or loss.dim() != 0:
+            return {"name": name, "sr": -999, "error": f"bad output: {type(loss)}", "code": code}
+        loss.backward()
+    except Exception as e:
+        return {"name": name, "sr": -999, "error": f"validate: {e}", "code": code}
 
+    # Evaluate on FinGAN (3 tickers) -- fn IS the financial_loss_fn directly
     results = {}
     for ticker in config.STAGE1_TICKERS:
         try:
             r = train_single_ticker_fingan(
-                ticker=ticker, financial_loss_fn=fingan_fn,
+                ticker=ticker, financial_loss_fn=fn,
                 max_epochs=100, warmup_epochs=15,
                 eval_every=20, patience=6,
                 device=device, verbose=False)
