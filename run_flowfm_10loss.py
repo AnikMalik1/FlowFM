@@ -228,7 +228,7 @@ def train_one(gpu_id, ticker, ti):
                 eval_state = {k: v.clone() for k, v in ema.shadow.items()}
                 orig_state = model.state_dict()
                 model.load_state_dict(eval_state)
-                val_sr = fast_val_sr(model, val, l, mu_cond, sd_cond, mu_x, sd_x, dev)
+                val_sr = fast_val_sr(model, val, l, mu_cond, sd_cond, mu_x, sd_x, dev, nsamp=1000, ode_steps=40)
                 model.load_state_dict(orig_state)
                 model.train()
 
