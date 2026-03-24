@@ -49,13 +49,15 @@ cd /projects/s5e/quant/fingan/FlowFM_v2/meta_loss
 
 ROUNDS=${ROUNDS:-20}
 N_SEEDS=${N_SEEDS:-3}
+RESULTS_SUBDIR=${RESULTS_SUBDIR:-llm_fingan_v4}
 RESUME_FLAG=""
-if [ -n "${RESUME:-}" ] && [ -f "results/llm_fingan_v2/messages.json" ]; then
-    RESUME_FLAG="--resume results/llm_fingan_v2/messages.json"
+if [ -n "${RESUME:-}" ] && [ -f "${RESUME}" ]; then
+    RESUME_FLAG="--resume ${RESUME}"
+    echo "[$(date)] Resuming from: ${RESUME}"
 fi
 
-echo "[$(date)] Starting LLM+Conversation v2: ROUNDS=$ROUNDS N_SEEDS=$N_SEEDS"
-python3 evolve_llm_fingan.py --rounds "$ROUNDS" --n_seeds "$N_SEEDS" $RESUME_FLAG
+echo "[$(date)] Starting LLM+Conversation: ROUNDS=$ROUNDS N_SEEDS=$N_SEEDS RESULTS_SUBDIR=$RESULTS_SUBDIR"
+python3 evolve_llm_fingan.py --rounds "$ROUNDS" --n_seeds "$N_SEEDS" --results-dir "$RESULTS_SUBDIR" $RESUME_FLAG
 
 EXIT_CODE=$?
 echo "[$(date)] LLM v2 finished with exit code $EXIT_CODE"

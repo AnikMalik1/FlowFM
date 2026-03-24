@@ -224,6 +224,8 @@ def main():
     parser.add_argument("--n_seeds", type=int, default=3)
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to messages.json to resume from")
+    parser.add_argument("--results-dir", type=str, default="llm_fingan_v4",
+                        help="Subdirectory under RESULTS_DIR for output")
     args = parser.parse_args()
 
     n_seeds = args.n_seeds
@@ -233,7 +235,7 @@ def main():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    results_dir = os.path.join(config.RESULTS_DIR, "llm_fingan_v4")
+    results_dir = os.path.join(config.RESULTS_DIR, args.results_dir)
     os.makedirs(results_dir, exist_ok=True)
 
     all_results = []
