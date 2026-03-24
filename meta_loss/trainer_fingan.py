@@ -90,12 +90,16 @@ def train_single_ticker_fingan(
     val_t = torch.from_numpy(val_np).float().to(device)
 
     N = train_t.shape[0]
-    mean_val = float(train_t.mean().item())
-    std_val = float(train_t.std().item()) + 1e-8
+    # Match original: ref_mean/std from first batch (tensor, not scalar)
+    ref_mean = train_t[:batch_size].mean()
+    ref_std = train_t[:batch_size].std()
 
-    # Use original FinGAN Generator and Discriminator classes
-    gen = FinGAN.Generator(z_dim, l + 1, hid_g, mean_val, std_val).to(device)
-    disc = FinGAN.Discriminator(l + 1, hid_d, mean_val, std_val).to(device)
+    # Original signatures: Generator(noise_dim, cond_dim, hidden_dim, output_dim, mean, std)
+    #                       Discriminator(in_dim, hidden_dim, mean, std)
+    gen = FinGAN.Generator(noise_dim=z_dim, cond_dim=l, hidden_dim=hid_g,
+                           output_dim=1, mean=ref_mean, std=ref_std).to(device)
+    disc = FinGAN.Discriminator(in_dim=l + 1, hidden_dim=hid_d,
+                                mean=ref_mean, std=ref_std).to(device)
     gen_opt = optim.RMSprop(gen.parameters(), lr=1e-4)
     disc_opt = optim.RMSprop(disc.parameters(), lr=1e-4)
     criterion = nn.BCELoss()
@@ -133,11 +137,11 @@ def train_single_ticker_fingan(
             with torch.no_grad():
                 fake_out = gen(noise, cond_b, h0g, c0g)  # (1, B, 1)
 
-            # Disc input = concat(cond, real) or concat(cond, fake)
-            fake_disc_in = torch.cat([cond_b, fake_out], dim=-1)  # (1, B, l+1)
+            # Disc input = concat(cond, value) along last dim -> (1, B, l+1)
+            fake_disc_in = torch.cat([cond_b, fake_out], dim=-1)
 
-            d_real = disc(real_disc_in, h0d, c0d)
-            d_fake = disc(fake_disc_in, h0d.clone(), c0d.clone())
+            d_real = disc(real_disc_in, h0d.detach().clone(), c0d.detach().clone())
+            d_fake = disc(fake_disc_in, h0d.detach().clone(), c0d.detach().clone())
             d_loss = (criterion(d_real, torch.ones_like(d_real)) +
                       criterion(d_fake, torch.zeros_like(d_fake))) / 2
             d_loss.backward()
@@ -149,7 +153,7 @@ def train_single_ticker_fingan(
             fake_out = gen(noise, cond_b, h0g, c0g)  # (1, B, 1)
 
             fake_disc_in = torch.cat([cond_b, fake_out], dim=-1)
-            d_fake = disc(fake_disc_in, h0d.clone(), c0d.clone())
+            d_fake = disc(fake_disc_in, h0d.detach().clone(), c0d.detach().clone())
             bce_loss = criterion(d_fake, torch.ones_like(d_fake))
 
             # Financial loss on generated returns
