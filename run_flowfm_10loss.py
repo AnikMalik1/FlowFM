@@ -57,36 +57,49 @@ def loss_sr(v_pred, v_target, x1_hat, x1_real, tanh_c=1.0):
     sr = -(torch.mean(pnl_vec) / (torch.std(pnl_vec) + 1e-8))
     return fm + 1000.0 * sr
 
+# All compound losses: exactly 1 FM base + additive auxiliary terms (no double-counting)
+LAMBDA = 1000.0
+
+def _aux_terms(x1_hat, x1_real, tanh_c):
+    """Shared computation for PnL/SR/MSE/STD auxiliary terms."""
+    ft = torch.tanh(tanh_c * x1_hat.squeeze(-1))
+    r = x1_real.squeeze(-1)
+    pnl_vec = ft * r
+    pnl = -torch.mean(pnl_vec)
+    sr = -(torch.mean(pnl_vec) / (torch.std(pnl_vec) + 1e-8))
+    mse = torch.mean((x1_hat - x1_real) ** 2)
+    std = torch.std(pnl_vec)
+    return pnl, sr, mse, std
+
 def loss_pnlmse(v_pred, v_target, x1_hat, x1_real, tanh_c=1.0):
-    return loss_pnl(v_pred, v_target, x1_hat, x1_real, tanh_c) + \
-           torch.mean((x1_hat - x1_real) ** 2)
+    fm = torch.mean((v_pred - v_target) ** 2)
+    pnl, _, mse, _ = _aux_terms(x1_hat, x1_real, tanh_c)
+    return fm + LAMBDA * pnl + mse
 
 def loss_pnlsr(v_pred, v_target, x1_hat, x1_real, tanh_c=1.0):
     fm = torch.mean((v_pred - v_target) ** 2)
-    ft = torch.tanh(tanh_c * x1_hat.squeeze(-1))
-    r = x1_real.squeeze(-1)
-    pnl = -torch.mean(ft * r)
-    pnl_vec = ft * r
-    sr = -(torch.mean(pnl_vec) / (torch.std(pnl_vec) + 1e-8))
-    return fm + 1000.0 * (pnl + sr)
+    pnl, sr, _, _ = _aux_terms(x1_hat, x1_real, tanh_c)
+    return fm + LAMBDA * (pnl + sr)
 
 def loss_pnlstd(v_pred, v_target, x1_hat, x1_real, tanh_c=1.0):
     fm = torch.mean((v_pred - v_target) ** 2)
-    ft = torch.tanh(tanh_c * x1_hat.squeeze(-1))
-    pnl_vec = ft * x1_real.squeeze(-1)
-    return fm + 1000.0 * (-torch.mean(pnl_vec) + torch.std(pnl_vec))
+    pnl, _, _, std = _aux_terms(x1_hat, x1_real, tanh_c)
+    return fm + LAMBDA * (-torch.mean(torch.tanh(tanh_c * x1_hat.squeeze(-1)) * x1_real.squeeze(-1)) + std)
 
 def loss_pnlmsesr(v_pred, v_target, x1_hat, x1_real, tanh_c=1.0):
-    return loss_pnlmse(v_pred, v_target, x1_hat, x1_real, tanh_c) + \
-           loss_sr(v_pred, v_target, x1_hat, x1_real, tanh_c)
+    fm = torch.mean((v_pred - v_target) ** 2)
+    pnl, sr, mse, _ = _aux_terms(x1_hat, x1_real, tanh_c)
+    return fm + mse + LAMBDA * (pnl + sr)
 
 def loss_pnlmsestd(v_pred, v_target, x1_hat, x1_real, tanh_c=1.0):
-    return loss_pnlmse(v_pred, v_target, x1_hat, x1_real, tanh_c) + \
-           loss_pnlstd(v_pred, v_target, x1_hat, x1_real, tanh_c)
+    fm = torch.mean((v_pred - v_target) ** 2)
+    pnl, _, mse, std = _aux_terms(x1_hat, x1_real, tanh_c)
+    return fm + mse + LAMBDA * (pnl + std)
 
 def loss_srmse(v_pred, v_target, x1_hat, x1_real, tanh_c=1.0):
-    return loss_sr(v_pred, v_target, x1_hat, x1_real, tanh_c) + \
-           torch.mean((x1_hat - x1_real) ** 2)
+    fm = torch.mean((v_pred - v_target) ** 2)
+    _, sr, mse, _ = _aux_terms(x1_hat, x1_real, tanh_c)
+    return fm + mse + LAMBDA * sr
 
 LOSS_FUNCTIONS = {
     "FM_only": loss_fm_only, "MSE": loss_mse, "PnL": loss_pnl,
@@ -120,9 +133,9 @@ def fast_val_sr(model, val_data, l, mu_cond, sd_cond, mu_x, sd_x, dev, nsamp=64,
 
 
 MODEL_CONFIGS = {
-    "small":  {"hidden": 32, "depth": 2},   # 16K params
-    "medium": {"hidden": 64, "depth": 2},   # 25K params (recommended)
-    "large":  {"hidden": 64, "depth": 4},   # 51K params
+    "small":  {"hidden": 32, "depth": 2},   # ~16K params
+    "medium": {"hidden": 64, "depth": 2},   # ~34K params (recommended)
+    "large":  {"hidden": 64, "depth": 4},   # ~51K params
 }
 
 # Select via env var: FLOWFM_CONFIG=small|medium|large (default: medium)
@@ -192,7 +205,7 @@ def train_one(gpu_id, ticker, ti):
 
             opt.zero_grad(set_to_none=True)
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            if True:  # fp32 for fair comparison with FinGAN (no bf16 autocast)
                 # Standard FM forward
                 B = x.shape[0]
                 t = torch.rand((B,), device=dev).clamp(1e-4, 1.0 - 1e-4)
@@ -235,7 +248,7 @@ def train_one(gpu_id, ticker, ti):
 
         # Test eval
         model.load_state_dict(torch.load(best_path, map_location=dev))
-        test_sr = fast_val_sr(model, test, l, mu_cond, sd_cond, mu_x, sd_x, dev, nsamp=256, ode_steps=10)
+        test_sr = fast_val_sr(model, test, l, mu_cond, sd_cond, mu_x, sd_x, dev, nsamp=1000, ode_steps=40)
 
         results.append({
             "ticker": ticker, "type": loss_name,
