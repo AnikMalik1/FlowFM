@@ -1,0 +1,53 @@
+#!/bin/bash
+#SBATCH --account=brics.s5e
+#SBATCH --partition=workq
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=72
+#SBATCH --gres=gpu:1
+#SBATCH --time=04:00:00
+#SBATCH --output=/projects/s5e/quant/fingan/FlowFM_ga/meta_loss/results/twolevel_%j.out
+#SBATCH --error=/projects/s5e/quant/fingan/FlowFM_ga/meta_loss/results/twolevel_%j.err
+
+# ── Conda ──
+source /projects/s5e/quant/miniforge3/etc/profile.d/conda.sh 2>/dev/null || true
+conda activate base 2>/dev/null || true
+export PATH="/projects/s5e/quant/miniforge3/bin:$PATH"
+
+set -euo pipefail
+
+# ── Antigravity Manager ──
+echo "[$(date)] Starting Antigravity Manager..."
+apptainer run \
+    --env API_KEY="${LLM_API_KEY:?LLM_API_KEY required}" \
+    --env ABV_PORT=18045 \
+    --env ABV_BIND_LOCAL_ONLY=true \
+    /projects/s5e/quant/antigravity-manager_latest.sif &
+AG_PID=$!
+
+for i in $(seq 1 30); do
+    curl -s --connect-timeout 2 http://127.0.0.1:18045/v1/models > /dev/null 2>&1 && break
+    sleep 2
+done
+
+echo "[$(date)] GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
+
+cd /projects/s5e/quant/fingan/FlowFM_ga/meta_loss
+
+POP=${POP_SIZE:-16}
+GA_GENS=${GA_GENS:-8}
+CYCLES=${CYCLES:-5}
+STAG=${STAGNATION:-3}
+
+echo "[$(date)] Two-Level: pop=$POP, ga_gens=$GA_GENS, cycles=$CYCLES, stagnation=$STAG"
+echo "[$(date)] Total evals budget: $((POP * GA_GENS * CYCLES))"
+
+python3 two_level_evolution.py \
+    --pop-size $POP \
+    --ga-gens $GA_GENS \
+    --cycles $CYCLES \
+    --stagnation $STAG
+
+echo "[$(date)] Done (exit=$?)"
+kill $AG_PID 2>/dev/null
+wait $AG_PID 2>/dev/null
